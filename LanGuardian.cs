@@ -648,8 +648,19 @@ namespace LanGuardian
                 Interlocked.Add(ref dstHost.WinRxBytes, wireLen);
             }
 
-            // Record active topology link for LAN-to-LAN or LAN-to-WAN traffic
-            if (!isIpBcast && srcIp != "0.0.0.0" && dstIp != "0.0.0.0")
+            int payloadOffset = offset + ihl;
+            int payloadLen = len - ihl;
+
+            // Record active topology link for LAN-to-LAN or LAN-to-WAN traffic (skip tiny NetBIOS 137 discovery probes)
+            bool isNetBiosProbe = false;
+            if (proto == 17 && payloadLen >= 4)
+            {
+                ushort sp = (ushort)((buf[payloadOffset] << 8) | buf[payloadOffset + 1]);
+                ushort dp = (ushort)((buf[payloadOffset + 2] << 8) | buf[payloadOffset + 3]);
+                if (sp == 137 || dp == 137) isNetBiosProbe = true;
+            }
+
+            if (!isIpBcast && !isNetBiosProbe && srcIp != "0.0.0.0" && dstIp != "0.0.0.0")
             {
                 if (srcInLan && dstInLan && srcIp != dstIp)
                 {
@@ -664,9 +675,6 @@ namespace LanGuardian
                     RecordLink(ActiveAdapter.Gateway, dstIp, "外网下行", wireLen);
                 }
             }
-
-            int payloadOffset = offset + ihl;
-            int payloadLen = len - ihl;
 
             if (proto == 6 && payloadLen >= 20) // TCP
             {
@@ -712,7 +720,7 @@ namespace LanGuardian
                     Interlocked.Increment(ref srcHost.RstPkts);
                     Interlocked.Increment(ref srcHost.WinRstPkts);
                 }
-                if (win == 0 && !rst && !syn)
+                if (win == 0 && !rst && !syn && !fin)
                 {
                     Interlocked.Increment(ref srcHost.TcpZeroWinPkts);
                 }
@@ -1044,8 +1052,8 @@ namespace LanGuardian
                 }
             }
 
-            // 7. High TCP Retransmission Rate / Zero Window (Bad cable, duplex mismatch, or 100Mbps switch bottleneck)
-            if (h.TcpTotalPkts >= 150 && (h.RetransRatePct >= 4.5 || h.TcpZeroWinPkts >= 15))
+            // 7. High TCP Retransmission Rate (Actual packet loss on physical cable, duplex mismatch, or 100Mbps switch bottleneck)
+            if (h.TcpTotalPkts >= 150 && h.TcpRetransPkts >= 10 && h.RetransRatePct >= 4.5)
             {
                 RaiseAlert(
                     "HIGH_RETRANS_" + h.Ip,
@@ -1055,11 +1063,31 @@ namespace LanGuardian
                     h.Ip,
                     h.Mac,
                     h.Vendor,
-                    string.Format("节点 {0} 的 TCP 报文总数 {1}，其中重传报文 {2} 个（重传率 {3:F1}%），TCP 零窗口报文 {4} 个。", h.Ip, h.TcpTotalPkts, h.TcpRetransPkts, h.RetransRatePct, h.TcpZeroWinPkts),
+                    string.Format("节点 {0} 的 TCP 报文总数 {1}，其中检出重传报文 {2} 个（重传率 {3:F1}%）。", h.Ip, h.TcpTotalPkts, h.TcpRetransPkts, h.RetransRatePct),
                     "正常局域网 TCP 重传率应低于 0.5%。重传率高说明数据包在物理链路途中被丢弃，常见原因：① 该机器或上级交换机网线水晶头接触不良/线序劣化；② 链路中间串接了老旧百兆（100Mbps）小路由器（如 TL-WR886N）或百兆交换机导致端口缓冲溢出丢包。",
                     "1. 检查该设备到交换机的网线，以及网卡协商速率是否为 1.0 Gbps 全双工；2. 若下级串了百兆小路由器，建议更换为千兆交换机或千兆 AP。",
                     "在维盟后台：【系统维护】->【ping检测】测试到该内网主机的丢包情况，并检查对应 LAN 口物理连接。",
                     "在 TP-LINK 后台：检查该终端是否挂在百兆下级路由（如 TL-WR886N）后面，建议将重度用网电脑直接接在千兆交换机上。"
+                );
+            }
+
+            // 8. High TCP Zero Window Rate (Application receive buffer full / disk or CPU bottleneck on endpoint)
+            double zeroWinPct = h.TcpTotalPkts >= 500 ? (h.TcpZeroWinPkts * 100.0 / h.TcpTotalPkts) : 0;
+            if (h.TcpTotalPkts >= 500 && h.TcpZeroWinPkts >= 80 && zeroWinPct >= 3.0)
+            {
+                RaiseAlert(
+                    "ZERO_WIN_" + h.Ip,
+                    "TCP_ZERO_WINDOW",
+                    "warning",
+                    string.Format("主机接收缓冲区满 (TCP 零窗口占比 {1:F1}%): {0}", h.Ip, zeroWinPct),
+                    h.Ip,
+                    h.Mac,
+                    h.Vendor,
+                    string.Format("节点 {0} 在 {1} 个 TCP 报文中发出了 {2} 个 TCP Zero-Window（零窗口）通告（占比 {3:F1}%），并非网线丢包重传（重传率为 {4:F1}%）。", h.Ip, h.TcpTotalPkts, h.TcpZeroWinPkts, zeroWinPct, h.RetransRatePct),
+                    "TCP 零窗口（Zero Window）不是网络丢包，而是指该主机的【应用程序或磁盘/CPU 处理不过来】，导致系统的 TCP 接收缓冲区被塞满，不得不通知对端暂停发包。",
+                    "检查该主机 (" + h.Ip + ") 的 CPU 占用率、磁盘读写队列（如机械硬盘满载）或正在接收大量数据的服务进程状态。",
+                    "网络层无需改动维盟路由器配置，重点排查该终端自身的 CPU 与磁盘 I/O 负载。",
+                    "网络层无需改动 TP-LINK 路由器配置，重点排查该终端自身的 CPU 与磁盘 I/O 负载。"
                 );
             }
         }
@@ -2046,7 +2074,11 @@ canvas#topoCanvas:active { cursor: grabbing; }
 
 table { width: 100%; border-collapse: collapse; font-size: 13px; }
 th, td { text-align: left; padding: 9px 10px; border-bottom: 1px solid var(--border); }
-th { color: var(--muted); font-weight: 600; background: rgba(15,23,42,0.5); }
+th { color: var(--muted); font-weight: 600; background: rgba(15,23,42,0.5); user-select: none; }
+th.sortable { cursor: pointer; transition: 0.15s; white-space: nowrap; }
+th.sortable:hover { color: #fff; background: rgba(56,189,248,0.12); }
+th.sortable.active-sort { color: var(--accent); background: rgba(56,189,248,0.16); }
+.sort-arrow { font-size: 10px; margin-left: 4px; opacity: 0.85; }
 tr { cursor: pointer; }
 tr:hover { background: rgba(56,189,248,0.08); }
 .foreign-row { background: rgba(239,68,68,0.12) !important; }
@@ -2140,21 +2172,21 @@ tr:hover { background: rgba(56,189,248,0.08); }
     <div style='overflow-x:auto;'>
       <table>
         <thead>
-          <tr>
-            <th>状态</th>
-            <th>类型</th>
-            <th>IP 地址</th>
-            <th>主机名</th>
-            <th>MAC 地址</th>
-            <th>设备厂商 (OUI)</th>
-            <th>实时下载</th>
-            <th>实时上传</th>
-            <th>包速率</th>
-            <th>广播/秒</th>
-            <th>新建连接/秒</th>
-            <th>TCP重传率</th>
-            <th>累计流量</th>
-            <th>近期访问域名 / 协议活动</th>
+          <tr id='hostTableHead'>
+            <th class='sortable' data-col='status' onclick='sortHosts(""status"")'>状态<span class='sort-arrow'></span></th>
+            <th class='sortable' data-col='role' onclick='sortHosts(""role"")'>类型<span class='sort-arrow'></span></th>
+            <th class='sortable' data-col='ip' onclick='sortHosts(""ip"")'>IP 地址<span class='sort-arrow'></span></th>
+            <th class='sortable' data-col='hostname' onclick='sortHosts(""hostname"")'>主机名<span class='sort-arrow'></span></th>
+            <th class='sortable' data-col='mac' onclick='sortHosts(""mac"")'>MAC 地址<span class='sort-arrow'></span></th>
+            <th class='sortable' data-col='vendor' onclick='sortHosts(""vendor"")'>设备厂商 (OUI)<span class='sort-arrow'></span></th>
+            <th class='sortable' data-col='rxKBps' onclick='sortHosts(""rxKBps"")'>实时下载<span class='sort-arrow'></span></th>
+            <th class='sortable' data-col='txKBps' onclick='sortHosts(""txKBps"")'>实时上传<span class='sort-arrow'></span></th>
+            <th class='sortable' data-col='pps' onclick='sortHosts(""pps"")'>包速率<span class='sort-arrow'></span></th>
+            <th class='sortable' data-col='bcastPps' onclick='sortHosts(""bcastPps"")'>广播/秒<span class='sort-arrow'></span></th>
+            <th class='sortable' data-col='synRate' onclick='sortHosts(""synRate"")'>新建连接/秒<span class='sort-arrow'></span></th>
+            <th class='sortable' data-col='retransPct' onclick='sortHosts(""retransPct"")'>TCP重传率<span class='sort-arrow'></span></th>
+            <th class='sortable' data-col='totalMB' onclick='sortHosts(""totalMB"")'>累计流量<span class='sort-arrow'></span></th>
+            <th class='sortable' data-col='activities' onclick='sortHosts(""activities"")'>近期访问域名 / 协议活动<span class='sort-arrow'></span></th>
           </tr>
         </thead>
         <tbody id='hostTable'></tbody>
@@ -2252,10 +2284,17 @@ let currentTab = 'overview';
 let topoLayout = 'tree'; // 'tree' | 'radial'
 let selectedNodeId = null;
 
-// Topology Canvas Interaction State
+// Table Sorting State
+let sortCol = '';
+let sortAsc = false;
+
+// Topology Canvas Interaction & Logical Coordinate State
 let topoZoom = 1.0;
 let topoPanX = 0;
 let topoPanY = 0;
+let topoLogicW = 1000;
+let topoLogicH = 560;
+let topoDpr = 1;
 let isDraggingCanvas = false;
 let draggedNode = null;
 let dragStartX = 0;
@@ -2264,6 +2303,48 @@ let nodePositions = {}; // id -> {x, y, pinned}
 let topoGraphNodes = [];
 let topoGraphEdges = [];
 let animTick = 0;
+
+function ipToNum(ip) {
+  if (!ip) return 0;
+  const p = ip.split('.').map(x => parseInt(x, 10) || 0);
+  if (p.length !== 4) return 0;
+  return ((p[0] << 24) >>> 0) + (p[1] << 16) + (p[2] << 8) + p[3];
+}
+
+function hostStatusRank(h) {
+  if (!h.isLocal) return 5;
+  if (h.macCount > 1) return 4;
+  if (h.bcastPps >= 80 || h.synRate >= 40) return 3;
+  if (h.retransPct >= 4.5) return 2;
+  if (h.isGw) return 1;
+  return 0;
+}
+
+function sortHosts(col) {
+  if (sortCol === col) {
+    sortAsc = !sortAsc;
+  } else {
+    sortCol = col;
+    // String columns default to ascending (A-Z / small IP first); numeric rate columns default to descending (highest first)
+    sortAsc = ['ip', 'hostname', 'mac', 'vendor', 'role', 'activities'].includes(col);
+  }
+  if (lastStatus) renderStatus(lastStatus);
+}
+
+function updateSortHeaders() {
+  const ths = document.querySelectorAll('#hostTableHead th.sortable');
+  ths.forEach(th => {
+    const col = th.getAttribute('data-col');
+    const arrow = th.querySelector('.sort-arrow');
+    if (col === sortCol) {
+      th.classList.add('active-sort');
+      if (arrow) arrow.textContent = sortAsc ? '▲' : '▼';
+    } else {
+      th.classList.remove('active-sort');
+      if (arrow) arrow.textContent = '⇅';
+    }
+  });
+}
 
 const ROLE_META = {
   internet: { icon: '☁️', label: '互联网公网', color: '#38bdf8' },
@@ -2290,8 +2371,16 @@ function switchTab(tab) {
   document.getElementById('viewAlerts').classList.toggle('hidden', tab !== 'alerts');
 
   if (tab === 'topology' && lastStatus) {
-    resizeTopoCanvas();
-    rebuildTopologyGraph(lastStatus);
+    requestAnimationFrame(() => {
+      const sizeChanged = resizeTopoCanvas();
+      if (sizeChanged) {
+        // Clear unpinned positions that were computed while canvas was hidden
+        Object.keys(nodePositions).forEach(k => {
+          if (!nodePositions[k].pinned) delete nodePositions[k];
+        });
+      }
+      rebuildTopologyGraph(lastStatus);
+    });
   }
 }
 
@@ -2402,9 +2491,27 @@ function renderStatus(d) {
   document.getElementById('alertContainer').innerHTML = alertsHtml;
   document.getElementById('alertContainerFull').innerHTML = alertsHtml;
 
-  // Hosts table
+  // Hosts table (apply active user sort if selected)
+  updateSortHeaders();
+  const sortedHosts = (d.hosts || []).slice();
+  if (sortCol) {
+    sortedHosts.sort((a, b) => {
+      let va, vb;
+      if (sortCol === 'ip') { va = ipToNum(a.ip); vb = ipToNum(b.ip); }
+      else if (sortCol === 'status') { va = hostStatusRank(a); vb = hostStatusRank(b); }
+      else if (['rxKBps', 'txKBps', 'pps', 'bcastPps', 'synRate', 'retransPct', 'totalMB'].includes(sortCol)) {
+        va = Number(a[sortCol] || 0); vb = Number(b[sortCol] || 0);
+      } else {
+        va = String(a[sortCol] || '').toLowerCase();
+        vb = String(b[sortCol] || '').toLowerCase();
+        return sortAsc ? va.localeCompare(vb, 'zh-CN') : vb.localeCompare(va, 'zh-CN');
+      }
+      return sortAsc ? (va - vb) : (vb - va);
+    });
+  }
+
   const tb = document.getElementById('hostTable');
-  tb.innerHTML = d.hosts.map(h => {
+  tb.innerHTML = sortedHosts.map(h => {
     let badge = `<span class='tag ok'>正常</span>`;
     if (!h.isLocal) badge = `<span class='tag critical'>异网段异常</span>`;
     else if (h.macCount > 1) badge = `<span class='tag critical'>IP冲突</span>`;
@@ -2510,8 +2617,9 @@ function focusNodeInTopo(nodeId) {
 function rebuildTopologyGraph(d) {
   const c = document.getElementById('topoCanvas');
   if (!c) return;
-  const W = c.width;
-  const H = c.height;
+  if (currentTab === 'topology') resizeTopoCanvas();
+  const W = topoLogicW;
+  const H = topoLogicH;
 
   const filter = document.getElementById('topoFilter') ? document.getElementById('topoFilter').value : 'all';
   const alertMap = {};
@@ -2639,17 +2747,22 @@ function rebuildTopologyGraph(d) {
     });
   });
 
-  // 6. Add Peer-to-Peer Internal Traffic Arcs (from d.links)
+  // 6. Add Peer-to-Peer Internal Traffic Arcs (from d.links, filtering out tiny <1KB noise unless active)
   const nodeIdSet = new Set(nodes.map(n => n.id));
   (d.links || []).forEach(lk => {
     if (lk.src !== gwIp && lk.dst !== gwIp && nodeIdSet.has(lk.src) && nodeIdSet.has(lk.dst)) {
-      edges.push({
-        from: lk.src,
-        to: lk.dst,
-        kbps: Math.max(1, lk.kbps),
-        label: lk.label,
-        type: 'p2p'
-      });
+      if (lk.kbps >= 0.2 || lk.totalKB >= 1.5) {
+        const showLbl = (lk.kbps >= 1.0 || lk.src === selectedNodeId || lk.dst === selectedNodeId)
+          ? (lk.label + (lk.kbps >= 0.5 ? (' ' + lk.kbps.toFixed(0) + 'KB/s') : ''))
+          : '';
+        edges.push({
+          from: lk.src,
+          to: lk.dst,
+          kbps: Math.max(0.5, lk.kbps),
+          label: showLbl,
+          type: 'p2p'
+        });
+      }
     }
   });
 
@@ -2773,7 +2886,8 @@ function drawTopologyFrame() {
   const c = document.getElementById('topoCanvas');
   if (c && currentTab === 'topology' && topoGraphNodes.length > 0) {
     const ctx = c.getContext('2d');
-    const W = c.width, H = c.height;
+    const W = topoLogicW, H = topoLogicH;
+    ctx.setTransform(topoDpr, 0, 0, topoDpr, 0, 0);
     ctx.clearRect(0, 0, W, H);
 
     ctx.save();
@@ -2984,10 +3098,10 @@ function initTopoEvents() {
 
   const toWorld = (clientX, clientY) => {
     const rect = c.getBoundingClientRect();
-    const sx = (clientX - rect.left) * (c.width / rect.width);
-    const sy = (clientY - rect.top) * (c.height / rect.height);
-    const wx = (sx - c.width / 2 - topoPanX) / topoZoom + c.width / 2;
-    const wy = (sy - c.height / 2 - topoPanY) / topoZoom + c.height / 2;
+    const sx = (clientX - rect.left) * (topoLogicW / Math.max(1, rect.width));
+    const sy = (clientY - rect.top) * (topoLogicH / Math.max(1, rect.height));
+    const wx = (sx - topoLogicW / 2 - topoPanX) / topoZoom + topoLogicW / 2;
+    const wy = (sy - topoLogicH / 2 - topoPanY) / topoZoom + topoLogicH / 2;
     return { wx, wy, sx, sy };
   };
 
@@ -3038,11 +3152,23 @@ function initTopoEvents() {
 
 function resizeTopoCanvas() {
   const c = document.getElementById('topoCanvas');
-  if (!c || !c.parentElement) return;
-  const rect = c.parentElement.getBoundingClientRect();
-  if (rect.width > 200) {
-    c.width = Math.floor(rect.width);
+  if (!c) return false;
+  const rect = c.getBoundingClientRect();
+  if (rect.width > 200 && rect.height > 200) {
+    const dpr = window.devicePixelRatio || 1;
+    const newW = Math.floor(rect.width);
+    const newH = Math.floor(rect.height);
+    const changed = (newW !== topoLogicW || newH !== topoLogicH || dpr !== topoDpr);
+    if (changed) {
+      topoLogicW = newW;
+      topoLogicH = newH;
+      topoDpr = dpr;
+      c.width = Math.floor(newW * dpr);
+      c.height = Math.floor(newH * dpr);
+    }
+    return changed;
   }
+  return false;
 }
 
 function drawChart(hist) {
