@@ -55,6 +55,8 @@ namespace LanGuardian
         public long RstPkts = 0;
         public long TcpTotalPkts = 0;
         public long TcpRetransPkts = 0;
+        public long LanTcpTotalPkts = 0;
+        public long LanTcpRetransPkts = 0;
         public long TcpZeroWinPkts = 0;
         public long DnsQueryPkts = 0;
         public long DhcpServerPkts = 0;
@@ -249,7 +251,7 @@ namespace LanGuardian
 
     public class MonitorEngine
     {
-        public const string AppVersion = "v1.3.0";
+        public const string AppVersion = "v1.3.1";
         public List<AdapterInfo> Adapters = new List<AdapterInfo>();
         public AdapterInfo ActiveAdapter = new AdapterInfo();
         public uint SubnetNetUint = 0;
@@ -900,7 +902,12 @@ namespace LanGuardian
 
             if (srcHost != null)
             {
+                bool dstIsLan = IsInCurrentSubnet(dstIp);
+                bool involvesProbeWeb = (srcPort == 8088 || dstPort == 8088);
+                bool countForLanLink = dstIsLan && !involvesProbeWeb;
+
                 Interlocked.Increment(ref srcHost.TcpTotalPkts);
+                if (countForLanLink) Interlocked.Increment(ref srcHost.LanTcpTotalPkts);
                 if (syn && !ack)
                 {
                     Interlocked.Increment(ref srcHost.SynPkts);
@@ -921,8 +928,8 @@ namespace LanGuardian
                     Interlocked.Increment(ref srcHost.TcpZeroWinPkts);
                 }
 
-                // Lightweight TCP Retransmission detection for data packets
-                if (tcpDataLen > 0)
+                // Lightweight TCP Retransmission detection for data packets (separate LAN physical link vs WAN)
+                if (tcpDataLen > 0 && !involvesProbeWeb)
                 {
                     ulong flowKey = ComputeFlowKey(srcIp, dstIp, srcPort, dstPort);
                     uint prevMax;
@@ -932,6 +939,7 @@ namespace LanGuardian
                         if (diff < 0 && diff > -65536)
                         {
                             Interlocked.Increment(ref srcHost.TcpRetransPkts);
+                            if (countForLanLink) Interlocked.Increment(ref srcHost.LanTcpRetransPkts);
                         }
                         else if (diff > 0)
                         {
@@ -1069,9 +1077,13 @@ namespace LanGuardian
                         h.ArpPps = arpP;
                         h.SynRate = synP;
 
-                        if (h.TcpTotalPkts >= 50)
+                        if (h.LanTcpTotalPkts >= 50)
                         {
-                            h.RetransRatePct = Math.Round((double)h.TcpRetransPkts * 100.0 / h.TcpTotalPkts, 2);
+                            h.RetransRatePct = Math.Round((double)h.LanTcpRetransPkts * 100.0 / h.LanTcpTotalPkts, 2);
+                        }
+                        else
+                        {
+                            h.RetransRatePct = 0;
                         }
 
                         sumBps += totBps;
@@ -1249,23 +1261,28 @@ namespace LanGuardian
                 }
             }
 
-            // 7. High TCP Retransmission Rate (Actual packet loss on physical cable, duplex mismatch, or 100Mbps switch bottleneck)
-            if (h.TcpTotalPkts >= 150 && h.TcpRetransPkts >= 10 && h.RetransRatePct >= 4.5)
+            // 7. High LAN TCP Retransmission Rate (Actual packet loss on physical LAN cable/switch; excludes WAN & probe 8088 traffic)
+            if (h.LanTcpTotalPkts >= 150 && h.LanTcpRetransPkts >= 10 && h.RetransRatePct >= 4.5)
             {
                 RaiseAlert(
                     "HIGH_RETRANS_" + h.Ip,
                     "HIGH_RETRANSMIT",
                     "warning",
-                    string.Format("物理链路丢包重传偏高: {0} (重传率 {1:F1}%)", h.Ip, h.RetransRatePct),
+                    string.Format("内网物理链路丢包重传偏高: {0} (内网重传率 {1:F1}%)", h.Ip, h.RetransRatePct),
                     h.Ip,
                     h.Mac,
                     h.Vendor,
-                    string.Format("节点 {0} 的 TCP 报文总数 {1}，其中检出重传报文 {2} 个（重传率 {3:F1}%）。", h.Ip, h.TcpTotalPkts, h.TcpRetransPkts, h.RetransRatePct),
-                    "正常局域网 TCP 重传率应低于 0.5%。重传率高说明数据包在物理链路途中被丢弃，常见原因：① 该机器或上级交换机网线水晶头接触不良/线序劣化；② 链路中间串接了老旧百兆（100Mbps）小路由器（如 TL-WR886N）或百兆交换机导致端口缓冲溢出丢包。",
+                    string.Format("节点 {0} 的局域网内网 TCP 报文总数 {1}，其中检出重传报文 {2} 个（内网重传率 {3:F1}%；已排除外网链路与探针管理端口干扰）。", h.Ip, h.LanTcpTotalPkts, h.LanTcpRetransPkts, h.RetransRatePct),
+                    "正常局域网内网 TCP 重传率应低于 0.5%。重传率高说明数据包在局域网物理链路途中被丢弃，常见原因：① 该机器或上级交换机网线水晶头接触不良/线序劣化；② 链路中间串接了老旧百兆（100Mbps）小路由器（如 TL-WR886N）或百兆交换机导致端口缓冲溢出丢包。",
                     "1. 检查该设备到交换机的网线，以及网卡协商速率是否为 1.0 Gbps 全双工；2. 若下级串了百兆小路由器，建议更换为千兆交换机或千兆 AP。",
                     "在维盟后台：【系统维护】->【ping检测】测试到该内网主机的丢包情况，并检查对应 LAN 口物理连接。",
                     "在 TP-LINK 后台：检查该终端是否挂在百兆下级路由（如 TL-WR886N）后面，建议将重度用网电脑直接接在千兆交换机上。"
                 );
+            }
+            else if (h.RetransRatePct < 2.5)
+            {
+                AnomalyAlert removed;
+                Alerts.TryRemove("HIGH_RETRANS_" + h.Ip, out removed);
             }
 
             // 8. High TCP Zero Window Rate (Application receive buffer full / disk or CPU bottleneck on endpoint)
