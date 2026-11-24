@@ -286,7 +286,7 @@ namespace LanGuardian
         private string _preferredAdapterHint = "";
 
         // Recent packet ring buffer to deduplicate identical packets mirrored across multiple switch ports
-        private const int MirrorDedupSize = 128;
+        private const int MirrorDedupSize = 1024;
         private readonly ulong[] _dedupSigs = new ulong[MirrorDedupSize];
         private readonly long[] _dedupTicks = new long[MirrorDedupSize];
         private int _dedupCursor = 0;
@@ -302,7 +302,7 @@ namespace LanGuardian
                     if (_dedupSigs[i] == sig)
                     {
                         long diff = (now - _dedupTicks[i]) & 0x7FFFFFFF;
-                        if (diff < 35) return true;
+                        if (diff < 100) return true;
                     }
                 }
                 _dedupSigs[_dedupCursor] = sig;
