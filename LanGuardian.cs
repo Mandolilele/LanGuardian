@@ -27,6 +27,8 @@ namespace LanGuardian
         public string Dns = "";
         public long SpeedMbps = 0;
         public string PcapDeviceName = "";
+        public bool IsUp = true;
+        public bool IsMirrorCandidate = false;
     }
 
     public class HostStats
@@ -254,6 +256,7 @@ namespace LanGuardian
         public string ActiveCidr = "";
         public string CaptureEngineName = "初始化中...";
         public bool NpcapAvailable = false;
+        public volatile bool IsPaused = false;
 
         public ConcurrentDictionary<string, HostStats> Hosts = new ConcurrentDictionary<string, HostStats>();
         public ConcurrentDictionary<string, AnomalyAlert> Alerts = new ConcurrentDictionary<string, AnomalyAlert>();
@@ -353,27 +356,42 @@ namespace LanGuardian
 
             foreach (var ni in NetworkInterface.GetAllNetworkInterfaces())
             {
-                if (ni.NetworkInterfaceType == NetworkInterfaceType.Loopback) continue;
+                if (ni.NetworkInterfaceType == NetworkInterfaceType.Loopback ||
+                    ni.NetworkInterfaceType == NetworkInterfaceType.Tunnel) continue;
+
                 var ipProps = ni.GetIPProperties();
                 var ipv4 = ipProps.UnicastAddresses
                     .FirstOrDefault(u => u.Address.AddressFamily == AddressFamily.InterNetwork && !IPAddress.IsLoopback(u.Address));
 
                 string ipStr = ipv4 != null ? ipv4.Address.ToString() : "";
                 string maskStr = (ipv4 != null && ipv4.IPv4Mask != null) ? ipv4.IPv4Mask.ToString() : "255.255.255.0";
-                if (ni.OperationalStatus != OperationalStatus.Up && string.IsNullOrEmpty(ipStr)) continue;
+                bool isUp = ni.OperationalStatus == OperationalStatus.Up;
+
+                // Keep all physical Ethernet adapters (even if unplugged or no IP assigned yet, for mirror NIC visibility)
+                bool isPhysicalEth = (ni.NetworkInterfaceType == NetworkInterfaceType.Ethernet ||
+                                      ni.NetworkInterfaceType == NetworkInterfaceType.GigabitEthernet ||
+                                      ni.NetworkInterfaceType == NetworkInterfaceType.FastEthernetT) &&
+                                     !ni.Description.Contains("Virtual") &&
+                                     !ni.Description.Contains("ZeroTier") &&
+                                     !ni.Description.Contains("WAN Miniport");
+
+                if (!isUp && string.IsNullOrEmpty(ipStr) && !isPhysicalEth) continue;
 
                 var gw = ipProps.GatewayAddresses
                     .FirstOrDefault(g => g.Address.AddressFamily == AddressFamily.InterNetwork && g.Address.ToString() != "0.0.0.0");
                 var dns = ipProps.DnsAddresses
                     .FirstOrDefault(d => d.AddressFamily == AddressFamily.InterNetwork);
 
+                string gwStr = gw != null ? gw.Address.ToString() : "";
                 string mac = FormatMac(ni.GetPhysicalAddress().GetAddressBytes());
-                string cidr = ComputeCidr(ipStr, maskStr);
+                string cidr = (!string.IsNullOrEmpty(ipStr) && !ipStr.StartsWith("169.254.")) ? ComputeCidr(ipStr, maskStr) : "";
                 string pcapDev = "";
                 if (!string.IsNullOrEmpty(ni.Id) && pcapMap.ContainsKey(ni.Id))
                 {
                     pcapDev = pcapMap[ni.Id];
                 }
+
+                bool isMirrorCand = isPhysicalEth && string.IsNullOrEmpty(gwStr);
 
                 list.Add(new AdapterInfo
                 {
@@ -384,11 +402,24 @@ namespace LanGuardian
                     Ip = ipStr,
                     Mask = maskStr,
                     Cidr = cidr,
-                    Gateway = gw != null ? gw.Address.ToString() : "",
+                    Gateway = gwStr,
                     Dns = dns != null ? dns.ToString() : "223.5.5.5",
                     SpeedMbps = ni.Speed > 0 ? ni.Speed / 1000000 : 1000,
-                    PcapDeviceName = pcapDev
+                    PcapDeviceName = pcapDev,
+                    IsUp = isUp,
+                    IsMirrorCandidate = isMirrorCand
                 });
+            }
+
+            // Inherit fallback CIDR & Gateway for mirror NICs that have 169.254.x.x or no IP
+            var primary = list.FirstOrDefault(a => !string.IsNullOrEmpty(a.Gateway) && !string.IsNullOrEmpty(a.Cidr));
+            if (primary != null)
+            {
+                foreach (var a in list)
+                {
+                    if (string.IsNullOrEmpty(a.Cidr)) a.Cidr = primary.Cidr;
+                    if (string.IsNullOrEmpty(a.Gateway)) a.Gateway = primary.Gateway;
+                }
             }
 
             Adapters = list;
@@ -437,8 +468,42 @@ namespace LanGuardian
             }
         }
 
+        public void TogglePause(bool? forceState = null)
+        {
+            bool next = forceState.HasValue ? forceState.Value : !IsPaused;
+            IsPaused = next;
+            if (IsPaused)
+            {
+                Interlocked.Increment(ref _captureGeneration);
+                try { if (_activePcapHandle != IntPtr.Zero) { NativeWin.pcap_close(_activePcapHandle); _activePcapHandle = IntPtr.Zero; } } catch { }
+                try { if (_activeRawSocket != null) { _activeRawSocket.Close(); _activeRawSocket = null; } } catch { }
+                CaptureEngineName = "⏸️ 监控已暂停 (点击顶部【恢复监控】可随时继续抓包)";
+            }
+            else
+            {
+                RestartPacketCapture();
+            }
+        }
+
+        public void ResetAllStats()
+        {
+            Hosts.Clear();
+            Alerts.Clear();
+            ActiveLinks.Clear();
+            TrafficPoint _;
+            while (History.TryDequeue(out _)) { }
+            Interlocked.Exchange(ref TotalCapturedPackets, 0);
+            Interlocked.Exchange(ref TotalCapturedBytes, 0);
+            CurrentTotalKBps = 0;
+            CurrentTotalPps = 0;
+            CurrentBcastPps = 0;
+            RefreshAdapters();
+            SetActiveAdapter(ActiveAdapter, ActiveCidr);
+        }
+
         public void RestartPacketCapture()
         {
+            if (IsPaused) return;
             int gen = Interlocked.Increment(ref _captureGeneration);
             try
             {
@@ -845,6 +910,7 @@ namespace LanGuardian
             while (_running)
             {
                 Thread.Sleep(1000);
+                if (IsPaused) continue;
                 try
                 {
                     double sumBps = 0;
@@ -1097,6 +1163,11 @@ namespace LanGuardian
             int cycle = 0;
             while (_running)
             {
+                if (IsPaused)
+                {
+                    Thread.Sleep(1000);
+                    continue;
+                }
                 try
                 {
                     // 1. Check Gateway, DNS, and External WAN Latency & Loss
@@ -1805,6 +1876,25 @@ namespace LanGuardian
                             _engine.Alerts.Clear();
                             SendJson(stream, "{\"ok\":true}");
                         }
+                        else if (path == "/api/toggle-pause")
+                        {
+                            _engine.TogglePause();
+                            SendJson(stream, "{\"ok\":true,\"paused\":" + (_engine.IsPaused ? "true" : "false") + "}");
+                        }
+                        else if (path == "/api/reset-all")
+                        {
+                            _engine.ResetAllStats();
+                            SendJson(stream, "{\"ok\":true}");
+                        }
+                        else if (path == "/download/LanGuardian.exe")
+                        {
+                            string exePath = Process.GetCurrentProcess().MainModule.FileName;
+                            byte[] exeBytes = File.ReadAllBytes(exePath);
+                            string hdr = "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Disposition: attachment; filename=\"LanGuardian.exe\"\r\nContent-Length: " + exeBytes.Length + "\r\nConnection: close\r\n\r\n";
+                            byte[] hdrBytes = Encoding.ASCII.GetBytes(hdr);
+                            stream.Write(hdrBytes, 0, hdrBytes.Length);
+                            stream.Write(exeBytes, 0, exeBytes.Length);
+                        }
                         else
                         {
                             SendHtml(stream, GetDashboardHtml());
@@ -1840,6 +1930,7 @@ namespace LanGuardian
             sb.Append("{");
             sb.AppendFormat("\"time\":\"{0}\",", DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss"));
             sb.AppendFormat("\"healthScore\":{0},", score);
+            sb.AppendFormat("\"paused\":{0},", _engine.IsPaused ? "true" : "false");
             sb.AppendFormat("\"captureEngine\":\"{0}\",", Esc(_engine.CaptureEngineName));
             sb.AppendFormat("\"npcap\":{0},", _engine.NpcapAvailable ? "true" : "false");
             sb.AppendFormat("\"activeCidr\":\"{0}\",", Esc(_engine.ActiveCidr));
@@ -1870,8 +1961,8 @@ namespace LanGuardian
             {
                 var a = _engine.Adapters[i];
                 if (i > 0) sb.Append(",");
-                sb.AppendFormat("{{\"id\":\"{0}\",\"name\":\"{1}\",\"desc\":\"{2}\",\"ip\":\"{3}\",\"cidr\":\"{4}\",\"gw\":\"{5}\"}}",
-                    Esc(a.Id), Esc(a.Name), Esc(a.Description), Esc(a.Ip), Esc(a.Cidr), Esc(a.Gateway));
+                sb.AppendFormat("{{\"id\":\"{0}\",\"name\":\"{1}\",\"desc\":\"{2}\",\"ip\":\"{3}\",\"cidr\":\"{4}\",\"gw\":\"{5}\",\"mac\":\"{6}\",\"isUp\":{7},\"isMirror\":{8}}}",
+                    Esc(a.Id), Esc(a.Name), Esc(a.Description), Esc(a.Ip), Esc(a.Cidr), Esc(a.Gateway), Esc(a.Mac), a.IsUp ? "true" : "false", a.IsMirrorCandidate ? "true" : "false");
             }
             sb.Append("],");
 
@@ -2095,11 +2186,13 @@ tr:hover { background: rgba(56,189,248,0.08); }
     </div>
   </div>
   <div class='controls'>
-    <select id='adapterSel' title='切换监控网卡（如端口镜像专用网卡）'></select>
-    <input id='cidrInput' type='text' placeholder='网段 CIDR (如 10.0.0.0/24)' style='width:145px;'>
+    <select id='adapterSel' title='切换监控网卡（支持选择第二块端口镜像专用网卡）'></select>
+    <input id='cidrInput' type='text' placeholder='网段 CIDR (如 10.0.0.0/24)' style='width:140px;'>
     <button onclick='applyAdapter()'>切换网卡/网段</button>
-    <button class='secondary' onclick='triggerScan()'>立即全网段扫描</button>
-    <button class='secondary' onclick='exportReport()'>导出诊断报告</button>
+    <button id='btnPauseToggle' class='secondary' onclick='togglePause()' style='border-color:#f59e0b;color:#fcd34d;'>⏸️ 暂停监控</button>
+    <button class='secondary' onclick='resetAllStats()' title='清空旧环境缓存数据并重新识别当前局域网'>🔄 重置数据</button>
+    <button class='secondary' onclick='triggerScan()'>立即扫描</button>
+    <button class='secondary' onclick='exportReport()'>导出报告</button>
   </div>
 </div>
 
@@ -2417,7 +2510,26 @@ async function fetchStatus() {
 }
 
 function renderStatus(d) {
-  document.getElementById('engineBadge').textContent = d.captureEngine;
+  const badgeEl = document.getElementById('engineBadge');
+  badgeEl.textContent = d.captureEngine;
+  badgeEl.style.background = d.paused ? 'rgba(245,158,11,0.2)' : 'rgba(56,189,248,0.15)';
+  badgeEl.style.color = d.paused ? '#fcd34d' : 'var(--accent)';
+
+  const pauseBtn = document.getElementById('btnPauseToggle');
+  if (pauseBtn) {
+    if (d.paused) {
+      pauseBtn.innerHTML = '▶️ 恢复监控';
+      pauseBtn.style.background = '#059669';
+      pauseBtn.style.borderColor = '#10b981';
+      pauseBtn.style.color = '#fff';
+    } else {
+      pauseBtn.innerHTML = '⏸️ 暂停监控';
+      pauseBtn.style.background = '#1e293b';
+      pauseBtn.style.borderColor = '#f59e0b';
+      pauseBtn.style.color = '#fcd34d';
+    }
+  }
+
   document.getElementById('curAdapter').textContent = (d.activeAdapter.name || '') + ' (' + (d.activeAdapter.ip || '无IP镜像口') + ')';
   document.getElementById('curCidr').textContent = d.activeCidr;
   document.getElementById('curGw').textContent = d.activeAdapter.gw || '未检测到';
@@ -2433,7 +2545,9 @@ function renderStatus(d) {
     d.adapters.forEach(a => {
       const opt = document.createElement('option');
       opt.value = a.id;
-      opt.textContent = a.name + ' [' + (a.ip || '仅抓包') + '] - ' + a.desc;
+      const tag = a.isMirror ? '【镜像/副网卡】' : (a.gw ? '【主上网口】' : '');
+      const state = a.isUp ? '' : ' (未插线)';
+      opt.textContent = tag + a.name + state + ' [' + (a.ip || '纯抓包无IP') + '] - ' + a.desc;
       if (a.id === d.activeAdapter.id) opt.selected = true;
       sel.appendChild(opt);
     });
@@ -3226,6 +3340,18 @@ async function triggerScan() {
 
 async function clearAlerts() {
   await fetch('/api/clear-alerts');
+  fetchStatus();
+}
+
+async function togglePause() {
+  await fetch('/api/toggle-pause');
+  fetchStatus();
+}
+
+async function resetAllStats() {
+  await fetch('/api/reset-all');
+  adapterInitialized = false;
+  resetNodePositions();
   fetchStatus();
 }
 
