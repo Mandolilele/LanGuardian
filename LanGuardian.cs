@@ -281,12 +281,58 @@ namespace LanGuardian
         private volatile int _captureGeneration = 0;
         private IntPtr _activePcapHandle = IntPtr.Zero;
         private Socket _activeRawSocket = null;
+        public string GatewayMac = "";
+        private string _preferredAdapterHint = "";
+
+        private static string GetConfigPath()
+        {
+            try
+            {
+                return Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "LanGuardian.cfg");
+            }
+            catch { return "LanGuardian.cfg"; }
+        }
+
+        public static string LoadSavedAdapterPreference()
+        {
+            try
+            {
+                string p = GetConfigPath();
+                if (File.Exists(p))
+                {
+                    foreach (string line in File.ReadAllLines(p))
+                    {
+                        if (line.StartsWith("adapter=", StringComparison.OrdinalIgnoreCase))
+                            return line.Substring(8).Trim();
+                    }
+                }
+            }
+            catch { }
+            return "";
+        }
+
+        public static void SaveAdapterPreference(string adapterId)
+        {
+            try
+            {
+                if (!string.IsNullOrEmpty(adapterId))
+                {
+                    File.WriteAllText(GetConfigPath(), "adapter=" + adapterId + Environment.NewLine, Encoding.UTF8);
+                }
+            }
+            catch { }
+        }
 
         public void Start(string preferredIpOrAdapter)
         {
+            if (string.IsNullOrEmpty(preferredIpOrAdapter))
+            {
+                preferredIpOrAdapter = LoadSavedAdapterPreference();
+            }
+            _preferredAdapterHint = preferredIpOrAdapter ?? "";
             DetectNpcap();
             RefreshAdapters();
-            SelectBestAdapter(preferredIpOrAdapter);
+            SelectBestAdapter(_preferredAdapterHint);
 
             _running = true;
             Task.Run(() => TickerLoop());
@@ -322,6 +368,7 @@ namespace LanGuardian
         {
             var list = new List<AdapterInfo>();
             var pcapMap = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            var pcapEntries = new List<Tuple<string, string, string>>();
 
             if (NpcapAvailable)
             {
@@ -336,6 +383,7 @@ namespace LanGuardian
                         {
                             var pif = Marshal.PtrToStructure<NativeWin.pcap_if>(cur);
                             string name = pif.name != IntPtr.Zero ? Marshal.PtrToStringAnsi(pif.name) : "";
+                            string desc = pif.description != IntPtr.Zero ? Marshal.PtrToStringAnsi(pif.description) : "";
                             if (!string.IsNullOrEmpty(name))
                             {
                                 // Extract GUID {xxxx-...}
@@ -344,6 +392,7 @@ namespace LanGuardian
                                 {
                                     string guid = name.Substring(brace);
                                     pcapMap[guid] = name;
+                                    pcapEntries.Add(Tuple.Create(guid, name, desc));
                                 }
                             }
                             cur = pif.next;
@@ -411,6 +460,40 @@ namespace LanGuardian
                 });
             }
 
+            // Also include pure L2 Npcap adapters (e.g. mirror NICs with IPv4/IPv6 disabled so .NET NetworkInterface hides them)
+            foreach (var pe in pcapEntries)
+            {
+                string guid = pe.Item1;
+                string pcapName = pe.Item2;
+                string pcapDesc = pe.Item3 ?? "";
+                if (list.Any(a => string.Equals(a.Id, guid, StringComparison.OrdinalIgnoreCase))) continue;
+                if (pcapName.IndexOf("Loopback", StringComparison.OrdinalIgnoreCase) >= 0) continue;
+                if (pcapDesc.IndexOf("Loopback", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                    pcapDesc.IndexOf("Virtual", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                    pcapDesc.IndexOf("ZeroTier", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                    pcapDesc.IndexOf("WAN Miniport", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                    pcapDesc.IndexOf("Bluetooth", StringComparison.OrdinalIgnoreCase) >= 0) continue;
+
+                string friendlyName = !string.IsNullOrEmpty(pcapDesc) ? ("镜像口: " + pcapDesc) : "纯二层镜像网卡";
+
+                list.Add(new AdapterInfo
+                {
+                    Id = guid,
+                    Name = friendlyName,
+                    Description = pcapDesc,
+                    Mac = "",
+                    Ip = "",
+                    Mask = "255.255.255.0",
+                    Cidr = "",
+                    Gateway = "",
+                    Dns = "223.5.5.5",
+                    SpeedMbps = 1000,
+                    PcapDeviceName = pcapName,
+                    IsUp = true,
+                    IsMirrorCandidate = true
+                });
+            }
+
             // Inherit fallback CIDR & Gateway for mirror NICs that have 169.254.x.x or no IP
             var primary = list.FirstOrDefault(a => !string.IsNullOrEmpty(a.Gateway) && !string.IsNullOrEmpty(a.Cidr));
             if (primary != null)
@@ -431,9 +514,16 @@ namespace LanGuardian
             if (!string.IsNullOrEmpty(preferred))
             {
                 chosen = Adapters.FirstOrDefault(a =>
-                    string.Equals(a.Ip, preferred, StringComparison.OrdinalIgnoreCase) ||
                     string.Equals(a.Id, preferred, StringComparison.OrdinalIgnoreCase) ||
+                    (!string.IsNullOrEmpty(a.Ip) && string.Equals(a.Ip, preferred, StringComparison.OrdinalIgnoreCase)) ||
                     a.Name.IndexOf(preferred, StringComparison.OrdinalIgnoreCase) >= 0);
+            }
+            if (chosen == null && NpcapAvailable)
+            {
+                // Auto-select connected L2 mirror NIC if present alongside a primary uplink NIC
+                chosen = Adapters.FirstOrDefault(a =>
+                    a.IsMirrorCandidate && a.IsUp &&
+                    !string.IsNullOrEmpty(a.Cidr) && !string.IsNullOrEmpty(a.PcapDeviceName));
             }
             if (chosen == null)
             {
@@ -1170,6 +1260,20 @@ namespace LanGuardian
                 }
                 try
                 {
+                    // 0. If adapters were not ready at boot time, re-discover until active CIDR & adapter are ready
+                    if (Adapters.Count == 0 || string.IsNullOrEmpty(ActiveCidr) || string.IsNullOrEmpty(ActiveAdapter.Id))
+                    {
+                        RefreshAdapters();
+                        if (Adapters.Count > 0)
+                        {
+                            SelectBestAdapter(_preferredAdapterHint);
+                            if (!string.IsNullOrEmpty(ActiveAdapter.Id))
+                            {
+                                RestartPacketCapture();
+                            }
+                        }
+                    }
+
                     // 1. Check Gateway, DNS, and External WAN Latency & Loss
                     if (!string.IsNullOrEmpty(ActiveAdapter.Gateway))
                     {
@@ -1541,14 +1645,25 @@ namespace LanGuardian
 
             h.LastSeen = DateTime.Now;
             h.IsLocalSubnet = IsInCurrentSubnet(ip);
+            bool isGwHost = h.IsGateway || string.Equals(ip, ActiveAdapter.Gateway, StringComparison.OrdinalIgnoreCase);
             if (IsValidUnicastMac(normMac))
             {
-                h.Mac = normMac;
-                h.Vendor = OuiDb.Lookup(normMac);
-                // Only record MAC for ARP conflict check if this IP is in our local subnet
-                if (h.IsLocalSubnet)
+                if (isGwHost)
                 {
-                    h.SeenMacs[normMac] = DateTime.Now;
+                    GatewayMac = normMac;
+                }
+                // In port-mirroring mode, router-forwarded L3 packets carry the gateway MAC; do not attribute them to LAN hosts
+                bool isForeignGwMac = !isGwHost && !string.IsNullOrEmpty(GatewayMac) &&
+                    string.Equals(normMac, GatewayMac, StringComparison.OrdinalIgnoreCase);
+                if (!isForeignGwMac)
+                {
+                    h.Mac = normMac;
+                    h.Vendor = OuiDb.Lookup(normMac);
+                    // Only record MAC for ARP conflict check if this IP is in our local subnet
+                    if (h.IsLocalSubnet)
+                    {
+                        h.SeenMacs[normMac] = DateTime.Now;
+                    }
                 }
             }
             return h;
@@ -1862,6 +1977,7 @@ namespace LanGuardian
                             var found = _engine.Adapters.FirstOrDefault(a => a.Id == ifaceId || a.Ip == ifaceId);
                             if (found != null)
                             {
+                                MonitorEngine.SaveAdapterPreference(found.Id);
                                 _engine.SetActiveAdapter(found, cidr);
                                 _engine.RestartPacketCapture();
                             }
