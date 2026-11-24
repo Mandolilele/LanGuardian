@@ -249,6 +249,7 @@ namespace LanGuardian
 
     public class MonitorEngine
     {
+        public const string AppVersion = "v1.3.0";
         public List<AdapterInfo> Adapters = new List<AdapterInfo>();
         public AdapterInfo ActiveAdapter = new AdapterInfo();
         public uint SubnetNetUint = 0;
@@ -283,6 +284,33 @@ namespace LanGuardian
         private Socket _activeRawSocket = null;
         public string GatewayMac = "";
         private string _preferredAdapterHint = "";
+
+        // Recent packet ring buffer to deduplicate identical packets mirrored across multiple switch ports
+        private const int MirrorDedupSize = 128;
+        private readonly ulong[] _dedupSigs = new ulong[MirrorDedupSize];
+        private readonly long[] _dedupTicks = new long[MirrorDedupSize];
+        private int _dedupCursor = 0;
+        private readonly object _dedupLock = new object();
+
+        private bool IsMirrorDuplicatePacket(ulong sig)
+        {
+            long now = Environment.TickCount & 0x7FFFFFFF;
+            lock (_dedupLock)
+            {
+                for (int i = 0; i < MirrorDedupSize; i++)
+                {
+                    if (_dedupSigs[i] == sig)
+                    {
+                        long diff = (now - _dedupTicks[i]) & 0x7FFFFFFF;
+                        if (diff < 35) return true;
+                    }
+                }
+                _dedupSigs[_dedupCursor] = sig;
+                _dedupTicks[_dedupCursor] = now;
+                _dedupCursor = (_dedupCursor + 1) & (MirrorDedupSize - 1);
+            }
+            return false;
+        }
 
         private static string GetConfigPath()
         {
@@ -765,6 +793,19 @@ namespace LanGuardian
             if (ihl < 20 || len < ihl) return;
 
             byte proto = buf[offset + 9];
+            ushort ipId = (ushort)((buf[offset + 4] << 8) | buf[offset + 5]);
+            int payloadOffset0 = offset + ihl;
+            int payloadLen0 = len - ihl;
+            if (ipId != 0 || proto == 6)
+            {
+                uint sIpU = ((uint)buf[offset + 12] << 24) | ((uint)buf[offset + 13] << 16) | ((uint)buf[offset + 14] << 8) | buf[offset + 15];
+                uint dIpU = ((uint)buf[offset + 16] << 24) | ((uint)buf[offset + 17] << 16) | ((uint)buf[offset + 18] << 8) | buf[offset + 19];
+                uint t4 = payloadLen0 >= 4 ? (((uint)buf[payloadOffset0] << 24) | ((uint)buf[payloadOffset0 + 1] << 16) | ((uint)buf[payloadOffset0 + 2] << 8) | buf[payloadOffset0 + 3]) : 0;
+                uint t8 = payloadLen0 >= 8 ? (((uint)buf[payloadOffset0 + 4] << 24) | ((uint)buf[payloadOffset0 + 5] << 16) | ((uint)buf[payloadOffset0 + 6] << 8) | buf[payloadOffset0 + 7]) : 0;
+                ulong sig = ((ulong)sIpU << 32) ^ dIpU ^ ((ulong)proto << 48) ^ ((ulong)ipId << 16) ^ ((ulong)wireLen << 4) ^ ((ulong)t4 << 20) ^ t8;
+                if (IsMirrorDuplicatePacket(sig)) return;
+            }
+
             string srcIp = string.Format("{0}.{1}.{2}.{3}", buf[offset + 12], buf[offset + 13], buf[offset + 14], buf[offset + 15]);
             string dstIp = string.Format("{0}.{1}.{2}.{3}", buf[offset + 16], buf[offset + 17], buf[offset + 18], buf[offset + 19]);
 
@@ -2044,6 +2085,7 @@ namespace LanGuardian
             int score = Math.Max(20, 100 - critCount * 22 - warnCount * 8);
 
             sb.Append("{");
+            sb.AppendFormat("\"version\":\"{0}\",", Esc(MonitorEngine.AppVersion));
             sb.AppendFormat("\"time\":\"{0}\",", DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss"));
             sb.AppendFormat("\"healthScore\":{0},", score);
             sb.AppendFormat("\"paused\":{0},", _engine.IsPaused ? "true" : "false");
@@ -2198,39 +2240,129 @@ namespace LanGuardian
 <title>LanGuardian 局域网实时检测与故障诊断中心</title>
 <style>
 :root {
-  --bg: #0b1120;
-  --card: #131c31;
-  --card2: #0f172a;
-  --border: #233252;
-  --text: #e2e8f0;
-  --muted: #94a3b8;
-  --accent: #38bdf8;
+  --bg: #14161a;
+  --card: #1c1f26;
+  --card2: #181a20;
+  --border: #2a2f3a;
+  --text: #e8eaed;
+  --muted: #9aa0a6;
+  --accent: #6c6cf5;
+  --accent2: #8e8eff;
   --purple: #a855f7;
   --ok: #10b981;
   --warn: #f59e0b;
   --crit: #ef4444;
 }
 * { box-sizing: border-box; margin: 0; padding: 0; }
-body { font-family: -apple-system, 'Microsoft YaHei', sans-serif; background: var(--bg); color: var(--text); padding: 16px 22px; line-height: 1.5; }
+body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Microsoft YaHei', sans-serif; background: var(--bg); color: var(--text); padding: 16px 22px; line-height: 1.5; }
 .header { display: flex; flex-wrap: wrap; justify-content: space-between; align-items: center; gap: 12px; padding-bottom: 14px; border-bottom: 1px solid var(--border); margin-bottom: 14px; }
 .title-box h1 { font-size: 20px; font-weight: 700; color: #fff; display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
-.badge-engine { font-size: 12px; background: rgba(56,189,248,0.15); color: var(--accent); border: 1px solid rgba(56,189,248,0.35); padding: 3px 10px; border-radius: 999px; font-weight: 500; }
+.badge-version { font-size: 12px; background: #6c6cf5; color: #fff; padding: 2px 9px; border-radius: 999px; font-weight: 600; letter-spacing: 0.3px; }
+.badge-engine { font-size: 12px; background: rgba(108,108,245,0.16); color: #a5a5ff; border: 1px solid rgba(108,108,245,0.4); padding: 3px 10px; border-radius: 999px; font-weight: 500; }
 .controls { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
-select, input, button { background: #1e293b; color: var(--text); border: 1px solid var(--border); padding: 6px 12px; border-radius: 6px; font-size: 13px; }
-button { cursor: pointer; background: #0284c7; border-color: #0369a1; color: #fff; font-weight: 500; transition: 0.15s; }
-button:hover { background: #0369a1; }
-button.secondary { background: #1e293b; border-color: var(--border); color: var(--text); }
-button.secondary:hover { background: #334155; }
-button.secondary.active { background: rgba(56,189,248,0.2); border-color: var(--accent); color: #fff; }
+select, input, button { background: #20242c; color: var(--text); border: 1px solid var(--border); padding: 6px 12px; border-radius: 6px; font-size: 13px; }
+button { cursor: pointer; background: #6c6cf5; border-color: #5b5be0; color: #fff; font-weight: 500; transition: 0.15s; }
+button:hover { background: #5a5ae2; }
+button.secondary { background: #20242c; border-color: var(--border); color: var(--text); }
+button.secondary:hover { background: #2b303b; border-color: #3d4454; }
+button.secondary.active { background: rgba(108,108,245,0.22); border-color: #6c6cf5; color: #fff; }
 
-/* Navigation Tabs */
-.nav-tabs { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 10px; margin-bottom: 16px; background: var(--card2); padding: 8px 12px; border-radius: 10px; border: 1px solid var(--border); }
-.tab-group { display: flex; gap: 8px; flex-wrap: wrap; }
-.tab-btn { background: transparent; border: 1px solid transparent; color: var(--muted); padding: 7px 15px; border-radius: 7px; font-size: 13.5px; font-weight: 600; cursor: pointer; display: flex; align-items: center; gap: 7px; }
-.tab-btn:hover { color: #fff; background: rgba(255,255,255,0.04); }
-.tab-btn.active { background: linear-gradient(135deg, #0284c7, #0369a1); color: #fff; border-color: #38bdf8; box-shadow: 0 2px 10px rgba(2,132,199,0.35); }
-.tab-badge { font-size: 11px; padding: 1px 7px; border-radius: 99px; background: rgba(255,255,255,0.18); color: #fff; }
-.tab-badge.crit { background: var(--crit); }
+/* Concave Radio Tabs Navigation (From Uiverse.io by german_7619, integrated into Dark Theme) */
+.nav-shell { position: relative; margin-bottom: 16px; }
+.nav-header-row { display: flex; align-items: flex-end; justify-content: space-between; flex-wrap: wrap; gap: 10px; background: #6c6cf5; border-top-left-radius: 0.5rem; border-top-right-radius: 0.5rem; padding: 0 1rem 0 0; }
+.radio-inputs {
+  position: relative;
+  display: flex;
+  border-top-left-radius: 0.5rem;
+  border-top-right-radius: 0.5rem;
+  background-color: #6c6cf5;
+  font-size: 14px;
+  padding: 0.5rem 1.5rem 0 1.5rem;
+  gap: 4px;
+}
+.radio-inputs .radio input { display: none; }
+.radio-inputs .radio .name {
+  display: flex;
+  cursor: pointer;
+  align-items: center;
+  justify-content: center;
+  border: none;
+  transition: all 0.15s ease-in-out;
+  position: relative;
+  border-top-left-radius: 0.5rem;
+  border-top-right-radius: 0.5rem;
+  color: rgba(255,255,255,0.88);
+}
+.radio-inputs .radio input + .name:hover { color: #fff; }
+.radio-inputs .radio input + .name .pre-name,
+.radio-inputs .radio input + .name .pos-name {
+  content: '';
+  position: absolute;
+  width: 10px;
+  height: 10px;
+  background-color: #6c6cf5;
+  bottom: 0;
+  opacity: 0;
+  pointer-events: none;
+}
+.radio-inputs .radio input + .name .pre-name {
+  right: -10px;
+  border-bottom-left-radius: 300px;
+  box-shadow: -3px 3px 0px 3px #e8e8e8;
+}
+.radio-inputs .radio input + .name .pos-name {
+  left: -10px;
+  border-bottom-right-radius: 300px;
+  box-shadow: 3px 3px 0px 3px #e8e8e8;
+}
+.radio-inputs .radio input:checked + .name {
+  animation: name-activated;
+  animation-duration: 0.1s;
+  animation-fill-mode: forwards;
+}
+@keyframes name-activated {
+  from { background-color: #6c6cf5; font-weight: 400; cursor: pointer; color: white; }
+  to { background-color: #e8e8e8; font-weight: 600; cursor: default; color: black; }
+}
+.radio-inputs .radio input:checked + .name .pre-name,
+.radio-inputs .radio input:checked + .name .pos-name {
+  animation: name-border-activated;
+  animation-duration: 0.1s;
+  animation-fill-mode: forwards;
+  z-index: 0;
+}
+@keyframes name-border-activated {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+.radio-inputs .radio .name span:last-child {
+  z-index: 1;
+  padding: 0.5rem 0.9rem;
+  border-top-left-radius: 0.5rem;
+  border-top-right-radius: 0.5rem;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+.radio-inputs .radio input:checked + .name span:last-child {
+  animation: name-text-activated;
+  animation-duration: 0.1s;
+  animation-fill-mode: forwards;
+}
+@keyframes name-text-activated {
+  from { background-color: #6c6cf5; }
+  to { background-color: #e8e8e8; }
+}
+@keyframes content-activated {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+.tab-badge { font-size: 11px; padding: 1px 7px; border-radius: 99px; background: rgba(0,0,0,0.22); color: #fff; font-weight: 600; }
+.radio-inputs .radio input:checked + .name .tab-badge { background: #6c6cf5; color: #fff; }
+.tab-badge.crit { background: var(--crit) !important; color: #fff !important; }
+.nav-tip { font-size: 12px; color: rgba(255,255,255,0.9); padding-bottom: 10px; }
+.nav-panel-frame { border: 3px solid #6c6cf5; border-top: 4px solid #e8e8e8; border-bottom-left-radius: 0.5rem; border-bottom-right-radius: 0.5rem; background: var(--bg); padding: 14px; }
+.tab-pane-anim { animation: content-activated 0.45s ease-out forwards; }
 
 /* Quick Topology Chain Bar */
 .chain-bar { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; background: var(--card); border: 1px solid var(--border); border-radius: 10px; padding: 10px 16px; margin-bottom: 16px; font-size: 12.5px; }
@@ -2268,9 +2400,9 @@ canvas#trafficCanvas { width: 100%; height: 140px; display: block; }
 /* Topology Tab Layout */
 .topo-wrapper { display: grid; grid-template-columns: 1fr 330px; gap: 14px; align-items: stretch; }
 @media (max-width: 1024px) { .topo-wrapper { grid-template-columns: 1fr; } }
-.topo-stage { background: radial-gradient(circle at 50% 35%, #16223d 0%, #0b1120 85%); border: 1px solid var(--border); border-radius: 12px; position: relative; overflow: hidden; min-height: 620px; display: flex; flex-direction: column; }
-.topo-toolbar { display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 8px; padding: 10px 14px; background: rgba(15,23,42,0.85); border-bottom: 1px solid var(--border); z-index: 2; }
-.topo-legend { display: flex; flex-wrap: wrap; gap: 12px; padding: 8px 14px; background: rgba(15,23,42,0.75); border-top: 1px solid var(--border); font-size: 12px; color: var(--muted); z-index: 2; }
+.topo-stage { background: radial-gradient(circle at 50% 35%, #1d2033 0%, #14161a 85%); border: 1px solid var(--border); border-radius: 12px; position: relative; overflow: hidden; min-height: 620px; display: flex; flex-direction: column; }
+.topo-toolbar { display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 8px; padding: 10px 14px; background: rgba(20,22,26,0.88); border-bottom: 1px solid var(--border); z-index: 2; }
+.topo-legend { display: flex; flex-wrap: wrap; gap: 12px; padding: 8px 14px; background: rgba(20,22,26,0.82); border-top: 1px solid var(--border); font-size: 12px; color: var(--muted); z-index: 2; }
 .legend-item { display: flex; align-items: center; gap: 5px; }
 canvas#topoCanvas { width: 100%; height: 540px; display: block; cursor: grab; flex: 1; }
 canvas#topoCanvas:active { cursor: grabbing; }
@@ -2296,9 +2428,9 @@ tr:hover { background: rgba(56,189,248,0.08); }
 <body>
 <div class='header'>
   <div class='title-box'>
-    <h1>LanGuardian 局域网实时检测与故障诊断中心 <span id='engineBadge' class='badge-engine'>加载中...</span></h1>
+    <h1>LanGuardian 局域网实时检测与故障诊断中心 <span id='versionBadge' class='badge-version'>v1.3.0</span> <span id='engineBadge' class='badge-engine'>加载中...</span></h1>
     <div style='font-size:12.5px;color:var(--muted);margin-top:4px;'>
-      当前监控网卡: <b id='curAdapter' style='color:#fff'>-</b> | 自动识别网段: <b id='curCidr' style='color:var(--accent)'>-</b> | 网关: <b id='curGw'>-</b>
+      当前监控网卡: <b id='curAdapter' style='color:#fff'>-</b> | 自动识别网段: <b id='curCidr' style='color:#a5a5ff'>-</b> | 网关: <b id='curGw'>-</b>
     </div>
   </div>
   <div class='controls'>
@@ -2312,29 +2444,44 @@ tr:hover { background: rgba(56,189,248,0.08); }
   </div>
 </div>
 
-<!-- 顶部多视图切换 Tab 栏 -->
-<div class='nav-tabs'>
-  <div class='tab-group'>
-    <button id='tabBtnOverview' class='tab-btn active' onclick='switchTab(""overview"")'>
-      📊 实时监控与故障诊断
-    </button>
-    <button id='tabBtnTopo' class='tab-btn' onclick='switchTab(""topology"")'>
-      🕸️ 网络拓扑与实时态势图 <span id='topoNodeBadge' class='tab-badge'>0</span>
-    </button>
-    <button id='tabBtnAlerts' class='tab-btn' onclick='switchTab(""alerts"")'>
-      🚨 异常诊断与修正方案 <span id='alertTabBadge' class='tab-badge'>0</span>
-    </button>
-  </div>
-  <div style='font-size:12px;color:var(--muted);display:flex;align-items:center;gap:10px;'>
-    <span>💡 点击任意主机或拓扑节点可查看单机深度透视与针对性修正建议</span>
-  </div>
-</div>
-
-<!-- 实时拓扑链路速览条 (在所有视图顶部直观展示出口链路与层级状态) -->
+<!-- 实时拓扑链路速览条 -->
 <div id='chainBar' class='chain-bar'></div>
 
+<!-- 顶部凹角滑块切换 Tab 栏 + 内容框架 -->
+<div class='nav-shell'>
+  <div class='nav-header-row'>
+    <div class='radio-inputs'>
+      <label class='radio'>
+        <input type='radio' name='lg-tab-group' id='tabBtnOverview' checked onchange='switchTab(""overview"")' />
+        <span class='name'>
+          <span class='pre-name'></span>
+          <span class='pos-name'></span>
+          <span>📊 实时监控与故障诊断</span>
+        </span>
+      </label>
+      <label class='radio'>
+        <input type='radio' name='lg-tab-group' id='tabBtnTopo' onchange='switchTab(""topology"")' />
+        <span class='name'>
+          <span class='pre-name'></span>
+          <span class='pos-name'></span>
+          <span>🕸️ 网络拓扑与实时态势图 <span id='topoNodeBadge' class='tab-badge'>0</span></span>
+        </span>
+      </label>
+      <label class='radio'>
+        <input type='radio' name='lg-tab-group' id='tabBtnAlerts' onchange='switchTab(""alerts"")' />
+        <span class='name'>
+          <span class='pre-name'></span>
+          <span class='pos-name'></span>
+          <span>🚨 异常诊断与修正方案 <span id='alertTabBadge' class='tab-badge'>0</span></span>
+        </span>
+      </label>
+    </div>
+    <div class='nav-tip'>💡 点击任意主机或拓扑节点可查看单机深度透视与修正建议</div>
+  </div>
+  <div class='nav-panel-frame'>
+
 <!-- ==================== TAB 1: 综合监控视图 ==================== -->
-<div id='viewOverview'>
+<div id='viewOverview' class='tab-pane-anim'>
   <div class='grid-4'>
     <div class='card'>
       <div class='card-label'>局域网健康评分</div>
@@ -2486,6 +2633,9 @@ tr:hover { background: rgba(56,189,248,0.08); }
   </div>
 </div>
 
+  </div><!-- /nav-panel-frame -->
+</div><!-- /nav-shell -->
+
 <script>
 let lastStatus = null;
 let adapterInitialized = false;
@@ -2571,13 +2721,24 @@ const ROLE_META = {
 
 function switchTab(tab) {
   currentTab = tab;
-  document.getElementById('tabBtnOverview').classList.toggle('active', tab === 'overview');
-  document.getElementById('tabBtnTopo').classList.toggle('active', tab === 'topology');
-  document.getElementById('tabBtnAlerts').classList.toggle('active', tab === 'alerts');
+  document.getElementById('tabBtnOverview').checked = (tab === 'overview');
+  document.getElementById('tabBtnTopo').checked = (tab === 'topology');
+  document.getElementById('tabBtnAlerts').checked = (tab === 'alerts');
 
-  document.getElementById('viewOverview').classList.toggle('hidden', tab !== 'overview');
-  document.getElementById('viewTopology').classList.toggle('hidden', tab !== 'topology');
-  document.getElementById('viewAlerts').classList.toggle('hidden', tab !== 'alerts');
+  const views = {
+    overview: document.getElementById('viewOverview'),
+    topology: document.getElementById('viewTopology'),
+    alerts: document.getElementById('viewAlerts')
+  };
+  Object.keys(views).forEach(k => {
+    const el = views[k];
+    el.classList.toggle('hidden', k !== tab);
+    if (k === tab) {
+      el.classList.remove('tab-pane-anim');
+      void el.offsetWidth;
+      el.classList.add('tab-pane-anim');
+    }
+  });
 
   if (tab === 'topology' && lastStatus) {
     requestAnimationFrame(() => {
@@ -2626,10 +2787,12 @@ async function fetchStatus() {
 }
 
 function renderStatus(d) {
+  const verEl = document.getElementById('versionBadge');
+  if (verEl && d.version) verEl.textContent = d.version;
   const badgeEl = document.getElementById('engineBadge');
   badgeEl.textContent = d.captureEngine;
-  badgeEl.style.background = d.paused ? 'rgba(245,158,11,0.2)' : 'rgba(56,189,248,0.15)';
-  badgeEl.style.color = d.paused ? '#fcd34d' : 'var(--accent)';
+  badgeEl.style.background = d.paused ? 'rgba(245,158,11,0.2)' : 'rgba(108,108,245,0.16)';
+  badgeEl.style.color = d.paused ? '#fcd34d' : '#a5a5ff';
 
   const pauseBtn = document.getElementById('btnPauseToggle');
   if (pauseBtn) {
