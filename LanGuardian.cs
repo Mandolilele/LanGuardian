@@ -249,11 +249,38 @@ namespace LanGuardian
         }
     }
 
+    public class NicLiveStats
+    {
+        public string Id = "";
+        public string Name = "";
+        public string Ip = "";
+        public string Cidr = "";
+        public bool IsMirror = false;
+        public long TotalPkts = 0;
+        public long TotalBytes = 0;
+        public long WinPkts = 0;
+        public long WinBytes = 0;
+        public double Pps = 0;
+        public double KBps = 0;
+        public ConcurrentDictionary<string, string> SeenMacToIp = new ConcurrentDictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        public ConcurrentDictionary<string, int> ObservedSubnets = new ConcurrentDictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+    }
+
     public class MonitorEngine
     {
-        public const string AppVersion = "v1.3.1";
+        public const string AppVersion = "v1.4.0";
         public List<AdapterInfo> Adapters = new List<AdapterInfo>();
         public AdapterInfo ActiveAdapter = new AdapterInfo();
+        public List<string> IgnoredLocalSubnets = new List<string>();
+        public HashSet<string> LocalHostIps = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        public HashSet<string> LocalHostMacs = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        public ConcurrentDictionary<string, NicLiveStats> NicStats = new ConcurrentDictionary<string, NicLiveStats>(StringComparer.OrdinalIgnoreCase);
+        public volatile bool IsolateCrossWireCheck = false;
+        public long CrossWireSyncHits = 0;
+        public List<string> CrossWireSharedMacs = new List<string>();
+        public bool DualNicSameSegment = true;
+        private IntPtr _secondaryPcapHandle = IntPtr.Zero;
+        private readonly ConcurrentDictionary<ulong, Tuple<string, long>> _crossBcastWindow = new ConcurrentDictionary<ulong, Tuple<string, long>>();
         public uint SubnetNetUint = 0;
         public uint SubnetMaskUint = 0;
         public string ActiveCidr = "";
@@ -394,9 +421,27 @@ namespace LanGuardian
             }
         }
 
+        public static bool IsVirtualAdapter(string name, string desc)
+        {
+            string s = ((name ?? "") + " " + (desc ?? "")).ToLowerInvariant();
+            string[] kw = new[] {
+                "zerotier", "tailscale", "wireguard", "wintun", "tap-windows", "tap-", "openvpn",
+                "hyper-v", "vethernet", "vmware", "virtualbox", "virtual", "wan miniport",
+                "bluetooth", "loopback", "radmin", "hamachi", "anyconnect", "sangfor", "vpn", "teredo", "isatap"
+            };
+            foreach (var k in kw)
+            {
+                if (s.Contains(k)) return true;
+            }
+            return false;
+        }
+
         public void RefreshAdapters()
         {
             var list = new List<AdapterInfo>();
+            var ignoredSubs = new List<string>();
+            var localIps = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            var localMacs = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
             var pcapMap = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
             var pcapEntries = new List<Tuple<string, string, string>>();
 
@@ -444,15 +489,20 @@ namespace LanGuardian
 
                 string ipStr = ipv4 != null ? ipv4.Address.ToString() : "";
                 string maskStr = (ipv4 != null && ipv4.IPv4Mask != null) ? ipv4.IPv4Mask.ToString() : "255.255.255.0";
-                bool isUp = ni.OperationalStatus == OperationalStatus.Up;
+                string cidr = (!string.IsNullOrEmpty(ipStr) && !ipStr.StartsWith("169.254.")) ? ComputeCidr(ipStr, maskStr) : "";
 
-                // Keep all physical Ethernet adapters (even if unplugged or no IP assigned yet, for mirror NIC visibility)
+                // Strictly isolate virtual VPN / ZeroTier / Hyper-V adapters so they never affect LAN monitoring
+                if (IsVirtualAdapter(ni.Name, ni.Description))
+                {
+                    if (!string.IsNullOrEmpty(cidr)) ignoredSubs.Add(cidr);
+                    if (!string.IsNullOrEmpty(ipStr)) localIps.Add(ipStr);
+                    continue;
+                }
+
+                bool isUp = ni.OperationalStatus == OperationalStatus.Up;
                 bool isPhysicalEth = (ni.NetworkInterfaceType == NetworkInterfaceType.Ethernet ||
                                       ni.NetworkInterfaceType == NetworkInterfaceType.GigabitEthernet ||
-                                      ni.NetworkInterfaceType == NetworkInterfaceType.FastEthernetT) &&
-                                     !ni.Description.Contains("Virtual") &&
-                                     !ni.Description.Contains("ZeroTier") &&
-                                     !ni.Description.Contains("WAN Miniport");
+                                      ni.NetworkInterfaceType == NetworkInterfaceType.FastEthernetT);
 
                 if (!isUp && string.IsNullOrEmpty(ipStr) && !isPhysicalEth) continue;
 
@@ -463,7 +513,9 @@ namespace LanGuardian
 
                 string gwStr = gw != null ? gw.Address.ToString() : "";
                 string mac = FormatMac(ni.GetPhysicalAddress().GetAddressBytes());
-                string cidr = (!string.IsNullOrEmpty(ipStr) && !ipStr.StartsWith("169.254.")) ? ComputeCidr(ipStr, maskStr) : "";
+                if (!string.IsNullOrEmpty(ipStr)) localIps.Add(ipStr);
+                if (IsValidUnicastMac(mac)) localMacs.Add(mac);
+
                 string pcapDev = "";
                 if (!string.IsNullOrEmpty(ni.Id) && pcapMap.ContainsKey(ni.Id))
                 {
@@ -497,12 +549,7 @@ namespace LanGuardian
                 string pcapName = pe.Item2;
                 string pcapDesc = pe.Item3 ?? "";
                 if (list.Any(a => string.Equals(a.Id, guid, StringComparison.OrdinalIgnoreCase))) continue;
-                if (pcapName.IndexOf("Loopback", StringComparison.OrdinalIgnoreCase) >= 0) continue;
-                if (pcapDesc.IndexOf("Loopback", StringComparison.OrdinalIgnoreCase) >= 0 ||
-                    pcapDesc.IndexOf("Virtual", StringComparison.OrdinalIgnoreCase) >= 0 ||
-                    pcapDesc.IndexOf("ZeroTier", StringComparison.OrdinalIgnoreCase) >= 0 ||
-                    pcapDesc.IndexOf("WAN Miniport", StringComparison.OrdinalIgnoreCase) >= 0 ||
-                    pcapDesc.IndexOf("Bluetooth", StringComparison.OrdinalIgnoreCase) >= 0) continue;
+                if (IsVirtualAdapter(pcapName, pcapDesc)) continue;
 
                 string friendlyName = !string.IsNullOrEmpty(pcapDesc) ? ("镜像口: " + pcapDesc) : "纯二层镜像网卡";
 
@@ -535,6 +582,9 @@ namespace LanGuardian
                 }
             }
 
+            IgnoredLocalSubnets = ignoredSubs;
+            LocalHostIps = localIps;
+            LocalHostMacs = localMacs;
             Adapters = list;
         }
 
@@ -636,6 +686,15 @@ namespace LanGuardian
             catch { }
             try
             {
+                if (_secondaryPcapHandle != IntPtr.Zero)
+                {
+                    NativeWin.pcap_close(_secondaryPcapHandle);
+                    _secondaryPcapHandle = IntPtr.Zero;
+                }
+            }
+            catch { }
+            try
+            {
                 if (_activeRawSocket != null)
                 {
                     _activeRawSocket.Close();
@@ -644,7 +703,140 @@ namespace LanGuardian
             }
             catch { }
 
+            NicStats.Clear();
+            _crossBcastWindow.Clear();
+            CrossWireSyncHits = 0;
+            CrossWireSharedMacs = new List<string>();
+            foreach (var a in Adapters)
+            {
+                NicStats[a.Id] = new NicLiveStats
+                {
+                    Id = a.Id,
+                    Name = a.Name,
+                    Ip = a.Ip,
+                    Cidr = a.Cidr,
+                    IsMirror = a.IsMirrorCandidate
+                };
+            }
+
             Task.Run(() => CaptureWorker(gen));
+
+            // Launch concurrent L2 listener on the second physical NIC (if present) for dual-segment & cross-wire detection
+            if (NpcapAvailable && Adapters.Count >= 2)
+            {
+                var secondary = Adapters.FirstOrDefault(a =>
+                    !string.Equals(a.Id, ActiveAdapter.Id, StringComparison.OrdinalIgnoreCase) &&
+                    a.IsUp && !string.IsNullOrEmpty(a.PcapDeviceName));
+                if (secondary != null)
+                {
+                    Task.Run(() => SecondaryCaptureWorker(gen, secondary));
+                }
+            }
+        }
+
+        private void SecondaryCaptureWorker(int gen, AdapterInfo nic)
+        {
+            try
+            {
+                var err = new StringBuilder(256);
+                IntPtr handle = NativeWin.pcap_open_live(nic.PcapDeviceName, 256, 1, 150, err);
+                if (handle == IntPtr.Zero) return;
+                _secondaryPcapHandle = handle;
+                int dlt = NativeWin.pcap_datalink(handle);
+                byte[] buf = new byte[256];
+                while (_running && gen == _captureGeneration)
+                {
+                    IntPtr hdrPtr = IntPtr.Zero;
+                    IntPtr dataPtr = IntPtr.Zero;
+                    int res = NativeWin.pcap_next_ex(handle, ref hdrPtr, ref dataPtr);
+                    if (res == 1 && hdrPtr != IntPtr.Zero && dataPtr != IntPtr.Zero)
+                    {
+                        var hdr = Marshal.PtrToStructure<NativeWin.pcap_pkthdr>(hdrPtr);
+                        int capLen = (int)Math.Min(hdr.caplen, 256u);
+                        if (capLen >= 14 && dlt == 1)
+                        {
+                            Marshal.Copy(dataPtr, buf, 0, capLen);
+                            InspectFrameForDualNic(nic.Id, buf, capLen, (int)hdr.len);
+                        }
+                    }
+                }
+            }
+            catch { }
+        }
+
+        private void InspectFrameForDualNic(string adapterId, byte[] buf, int capLen, int wireLen)
+        {
+            if (capLen < 14 || string.IsNullOrEmpty(adapterId)) return;
+            NicLiveStats ns;
+            if (!NicStats.TryGetValue(adapterId, out ns)) return;
+
+            Interlocked.Increment(ref ns.TotalPkts);
+            Interlocked.Add(ref ns.TotalBytes, wireLen);
+            Interlocked.Increment(ref ns.WinPkts);
+            Interlocked.Add(ref ns.WinBytes, wireLen);
+
+            string srcMac = FormatMac(buf, 6);
+            bool isBcast = (buf[0] & 0x01) != 0;
+            int offset = 12;
+            ushort etherType = (ushort)((buf[offset] << 8) | buf[offset + 1]);
+            offset += 2;
+            if (etherType == 0x8100 && capLen >= 18)
+            {
+                etherType = (ushort)((buf[offset + 2] << 8) | buf[offset + 3]);
+                offset += 4;
+            }
+
+            string srcIp = "";
+            ulong bcastSig = 0;
+            if (etherType == 0x0806 && capLen >= offset + 28) // ARP
+            {
+                srcIp = string.Format("{0}.{1}.{2}.{3}", buf[offset + 14], buf[offset + 15], buf[offset + 16], buf[offset + 17]);
+                uint sU = ((uint)buf[offset + 14] << 24) | ((uint)buf[offset + 15] << 16) | ((uint)buf[offset + 16] << 8) | buf[offset + 17];
+                uint tU = ((uint)buf[offset + 24] << 24) | ((uint)buf[offset + 25] << 16) | ((uint)buf[offset + 26] << 8) | buf[offset + 27];
+                bcastSig = ((ulong)sU << 32) ^ tU ^ 0x08060000UL;
+            }
+            else if (etherType == 0x0800 && capLen >= offset + 20) // IPv4
+            {
+                srcIp = string.Format("{0}.{1}.{2}.{3}", buf[offset + 12], buf[offset + 13], buf[offset + 14], buf[offset + 15]);
+                ushort ipId = (ushort)((buf[offset + 4] << 8) | buf[offset + 5]);
+                uint sU = ((uint)buf[offset + 12] << 24) | ((uint)buf[offset + 13] << 16) | ((uint)buf[offset + 14] << 8) | buf[offset + 15];
+                uint dU = ((uint)buf[offset + 16] << 24) | ((uint)buf[offset + 17] << 16) | ((uint)buf[offset + 18] << 8) | buf[offset + 19];
+                if (isBcast) bcastSig = ((ulong)sU << 32) ^ dU ^ ((ulong)ipId << 16) ^ (ulong)wireLen;
+            }
+
+            if (IsValidUnicastMac(srcMac) && !LocalHostMacs.Contains(srcMac))
+            {
+                if (!string.IsNullOrEmpty(srcIp) && srcIp != "0.0.0.0" && IsPrivateOrLocalIp(srcIp))
+                {
+                    if (ns.SeenMacToIp.Count < 512) ns.SeenMacToIp[srcMac] = srcIp;
+                    string sub24 = srcIp.Substring(0, srcIp.LastIndexOf('.')) + ".0/24";
+                    ns.ObservedSubnets.AddOrUpdate(sub24, 1, (k, v) => v + 1);
+                }
+                else if (ns.SeenMacToIp.Count < 512 && !ns.SeenMacToIp.ContainsKey(srcMac))
+                {
+                    ns.SeenMacToIp[srcMac] = "";
+                }
+            }
+
+            // Cross-wire broadcast frame collision detection (same broadcast/ARP frame seen on 2 physical NICs within 200ms)
+            if (isBcast && bcastSig != 0 && IsValidUnicastMac(srcMac) && !LocalHostMacs.Contains(srcMac))
+            {
+                long now = Environment.TickCount & 0x7FFFFFFF;
+                Tuple<string, long> prev;
+                if (_crossBcastWindow.TryGetValue(bcastSig, out prev))
+                {
+                    if (!string.Equals(prev.Item1, adapterId, StringComparison.OrdinalIgnoreCase))
+                    {
+                        long dt = (now - prev.Item2) & 0x7FFFFFFF;
+                        if (dt < 200)
+                        {
+                            Interlocked.Increment(ref CrossWireSyncHits);
+                        }
+                    }
+                }
+                if (_crossBcastWindow.Count > 2048) _crossBcastWindow.Clear();
+                _crossBcastWindow[bcastSig] = Tuple.Create(adapterId, now);
+            }
         }
 
         private void CaptureWorker(int gen)
@@ -727,6 +919,7 @@ namespace LanGuardian
         private void ProcessEthernetFrame(byte[] buf, int capLen, int wireLen)
         {
             if (capLen < 14) return;
+            InspectFrameForDualNic(ActiveAdapter.Id, buf, capLen, wireLen);
             string dstMac = FormatMac(buf, 0);
             string srcMac = FormatMac(buf, 6);
             bool isBcast = (buf[0] & 0x01) != 0; // Broadcast or Multicast bit
@@ -1098,6 +1291,16 @@ namespace LanGuardian
                     CurrentTotalPps = sumPps;
                     CurrentBcastPps = sumBcastPps;
 
+                    // Update per-NIC live stats & evaluate dual-NIC cross-wire leakage
+                    foreach (var ns in NicStats.Values)
+                    {
+                        long wp = Interlocked.Exchange(ref ns.WinPkts, 0);
+                        long wb = Interlocked.Exchange(ref ns.WinBytes, 0);
+                        ns.Pps = wp;
+                        ns.KBps = Math.Round(wb / 1024.0, 1);
+                    }
+                    EvaluateCrossWireLeak();
+
                     // Update active flow link rates and prune stale links (>45s)
                     var linkCutoff = DateTime.Now.AddSeconds(-45);
                     foreach (var lk in ActiveLinks.ToArray())
@@ -1169,8 +1372,8 @@ namespace LanGuardian
                 );
             }
 
-            // 3. Broadcast / ARP Scan Storm
-            if (h.BcastPps >= 120 || h.ArpPps >= 60)
+            // 3. Broadcast / ARP Scan Storm (skip probe's own physical IPs so self-discovery never self-alerts)
+            if (!LocalHostIps.Contains(h.Ip) && (h.BcastPps >= 120 || h.ArpPps >= 60))
             {
                 RaiseAlert(
                     "BCAST_STORM_" + h.Ip,
@@ -1395,8 +1598,8 @@ namespace LanGuardian
                     // 2. Parse system ARP table (`arp -a`) every cycle to catch all L2 neighbors even without Npcap
                     ReadSystemArpTable();
 
-                    // 3. Do a background non-intrusive subnet sweep every 4 cycles (~20s)
-                    if (cycle % 4 == 0)
+                    // 3. In L2 mirror mode, passive capture sees all LAN traffic; only sweep once at startup to avoid self-generated ARP noise
+                    if (cycle == 0 || (!ActiveAdapter.IsMirrorCandidate && cycle % 12 == 0))
                     {
                         Task.Run(() => SweepCurrentSubnet());
                     }
@@ -1480,6 +1683,12 @@ namespace LanGuardian
             if (IsInCurrentSubnet(ip)) return false;
             uint u = IpToUint(ip);
             if (u == 0) return false;
+            foreach (var cid in IgnoredLocalSubnets)
+            {
+                uint netU, maskU;
+                ParseCidr(cid, out netU, out maskU);
+                if (netU != 0 && maskU != 0 && (u & maskU) == netU) return true;
+            }
             foreach (var a in Adapters)
             {
                 if (a.Id == ActiveAdapter.Id || string.IsNullOrEmpty(a.Cidr)) continue;
@@ -1503,8 +1712,10 @@ namespace LanGuardian
                 hostCount = 254;
             }
 
-            Parallel.For(1, (int)hostCount, new ParallelOptions { MaxDegreeOfParallelism = 32 }, i =>
+            // Gentle paced sweep (~25ms per IP) so probe never causes ARP bursts on mirror port
+            for (int i = 1; i < (int)hostCount; i++)
             {
+                if (!_running || IsPaused) break;
                 string targetIp = UintToIp(baseIp + (uint)i);
                 try
                 {
@@ -1522,6 +1733,7 @@ namespace LanGuardian
                                 GetOrAddHost(targetIp, mac);
                             }
                         }
+                        Thread.Sleep(25);
                     }
                     else
                     {
@@ -1537,7 +1749,7 @@ namespace LanGuardian
                     }
                 }
                 catch { }
-            });
+            }
 
             // Resolve hostnames for discovered hosts missing a hostname (NetBIOS UDP 137 + Reverse DNS)
             foreach (var h in Hosts.Values)
@@ -1647,11 +1859,66 @@ namespace LanGuardian
             Interlocked.Add(ref link.TotalBytes, bytes);
         }
 
+        private void EvaluateCrossWireLeak()
+        {
+            var nics = NicStats.Values.ToList();
+            if (nics.Count < 2) return;
+            var a = nics[0];
+            var b = nics[1];
+
+            // Determine primary observed /24 subnet on each NIC
+            string subA = a.ObservedSubnets.OrderByDescending(kv => kv.Value).Select(kv => kv.Key).FirstOrDefault() ?? a.Cidr;
+            string subB = b.ObservedSubnets.OrderByDescending(kv => kv.Value).Select(kv => kv.Key).FirstOrDefault() ?? b.Cidr;
+            DualNicSameSegment = !string.IsNullOrEmpty(subA) && string.Equals(subA, subB, StringComparison.OrdinalIgnoreCase);
+
+            var shared = new List<string>();
+            foreach (var mac in a.SeenMacToIp.Keys)
+            {
+                if (b.SeenMacToIp.ContainsKey(mac) && !LocalHostMacs.Contains(mac))
+                {
+                    string ipA = a.SeenMacToIp[mac];
+                    string ipB = b.SeenMacToIp[mac];
+                    string label = mac + (!string.IsNullOrEmpty(ipA) ? (" (" + ipA + ")") : (!string.IsNullOrEmpty(ipB) ? (" (" + ipB + ")") : ""));
+                    shared.Add(label);
+                }
+            }
+            CrossWireSharedMacs = shared;
+
+            // Only raise critical CROSS_WIRE_LEAK if NICs belong to different physical subnets OR user explicitly enabled isolated cross-wire check
+            bool shouldAlert = (!DualNicSameSegment || IsolateCrossWireCheck) && (CrossWireSyncHits >= 3 || shared.Count >= 1);
+            if (shouldAlert)
+            {
+                string sample = string.Join(", ", shared.Take(5));
+                RaiseAlert(
+                    "CROSS_WIRE_LEAK",
+                    "CROSS_WIRE_LEAK",
+                    "critical",
+                    string.Format("检测到双物理网段串线 / 二层泄露！(同帧碰撞 {0} 次, 跨接设备 {1} 台)", CrossWireSyncHits, shared.Count),
+                    a.Name + " <-> " + b.Name,
+                    "",
+                    "双网段串线",
+                    string.Format("物理网卡 [{0}] (网段 {1}) 与 [{2}] (网段 {3}) 同时捕获到了相同的二层流量：200ms 内同步广播帧碰撞 {4} 次，双边同时现身的非本机 MAC 共 {5} 个：{6}。",
+                        a.Name, string.IsNullOrEmpty(subA) ? "未知" : subA,
+                        b.Name, string.IsNullOrEmpty(subB) ? "未知" : subB,
+                        CrossWireSyncHits, shared.Count, string.IsNullOrEmpty(sample) ? "见同步广播帧" : sample),
+                    "两个本应物理隔离的局域网之间存在二层串通，常见原因：① 有人误用网线将两套网络的交换机直接插在一起；② 某台无线 AP/路由器同时桥接了两个网段；③ 某台双网卡终端开启了 Windows 网桥。",
+                    "1. 核对上述双边同时现身的 MAC 对应设备位置；2. 逐一拔除两套核心交换机上的可疑级联线，观察同帧碰撞次数是否停止增长；3. 若当前两网卡本就是接在同一台路由器的主口+镜像口，请关闭顶部【物理隔离串线检测】开关。",
+                    "进入维盟后台：【防御配置】->【ARP列表】查对上述 MAC 所在接口并排查物理网线。",
+                    "进入 TP-LINK 后台：【终端管理】查找上述 MAC 对应终端并核实交换机级联口。"
+                );
+            }
+            else
+            {
+                AnomalyAlert removed;
+                Alerts.TryRemove("CROSS_WIRE_LEAK", out removed);
+            }
+        }
+
         public string InferRole(HostStats h)
         {
             if (!h.IsLocalSubnet) return "rogue";
             if (h.IsGateway || string.Equals(h.Ip, ActiveAdapter.Gateway, StringComparison.OrdinalIgnoreCase)) return "gateway";
-            if (string.Equals(h.Ip, ActiveAdapter.Ip, StringComparison.OrdinalIgnoreCase)) return "probe";
+            if (LocalHostIps.Contains(h.Ip) || string.Equals(h.Ip, ActiveAdapter.Ip, StringComparison.OrdinalIgnoreCase)) return "probe";
 
             string v = (h.Vendor ?? "").ToUpperInvariant();
             string n = (h.Hostname ?? "").ToUpperInvariant();
@@ -2055,6 +2322,11 @@ namespace LanGuardian
                             _engine.TogglePause();
                             SendJson(stream, "{\"ok\":true,\"paused\":" + (_engine.IsPaused ? "true" : "false") + "}");
                         }
+                        else if (path == "/api/toggle-crosswire")
+                        {
+                            _engine.IsolateCrossWireCheck = !_engine.IsolateCrossWireCheck;
+                            SendJson(stream, "{\"ok\":true,\"isolate\":" + (_engine.IsolateCrossWireCheck ? "true" : "false") + "}");
+                        }
                         else if (path == "/api/reset-all")
                         {
                             _engine.ResetAllStats();
@@ -2204,6 +2476,27 @@ namespace LanGuardian
                 sb.Append("}");
             }
             sb.Append("],");
+
+            // Dual-NIC concurrent monitoring & cross-wire detection summary
+            sb.Append("\"dualNic\":{");
+            sb.AppendFormat("\"isolateCheck\":{0},\"sameSegment\":{1},\"syncHits\":{2},\"sharedCount\":{3},\"ignoredVirtual\":{4},\"nics\":[",
+                _engine.IsolateCrossWireCheck ? "true" : "false",
+                _engine.DualNicSameSegment ? "true" : "false",
+                _engine.CrossWireSyncHits,
+                _engine.CrossWireSharedMacs.Count,
+                _engine.IgnoredLocalSubnets.Count);
+            var nicList = _engine.NicStats.Values.ToList();
+            for (int i = 0; i < nicList.Count; i++)
+            {
+                var ns = nicList[i];
+                if (i > 0) sb.Append(",");
+                string topSub = ns.ObservedSubnets.OrderByDescending(kv => kv.Value).Select(kv => kv.Key).FirstOrDefault() ?? ns.Cidr;
+                sb.AppendFormat("{{\"id\":\"{0}\",\"name\":\"{1}\",\"ip\":\"{2}\",\"subnet\":\"{3}\",\"kbps\":{4:F1},\"pps\":{5:F0},\"macs\":{6},\"isMirror\":{7},\"active\":{8} }}",
+                    Esc(ns.Id), Esc(ns.Name), Esc(ns.Ip), Esc(topSub), ns.KBps, ns.Pps, ns.SeenMacToIp.Count,
+                    ns.IsMirror ? "true" : "false",
+                    string.Equals(ns.Id, _engine.ActiveAdapter.Id, StringComparison.OrdinalIgnoreCase) ? "true" : "false");
+            }
+            sb.Append("]},");
 
             // Active Topology Links
             sb.Append("\"links\":[");
@@ -2445,7 +2738,7 @@ tr:hover { background: rgba(56,189,248,0.08); }
 <body>
 <div class='header'>
   <div class='title-box'>
-    <h1>LanGuardian 局域网实时检测与故障诊断中心 <span id='versionBadge' class='badge-version'>v1.3.0</span> <span id='engineBadge' class='badge-engine'>加载中...</span></h1>
+    <h1>LanGuardian 局域网实时检测与故障诊断中心 <span id='versionBadge' class='badge-version'>v1.4.0</span> <span id='engineBadge' class='badge-engine'>加载中...</span></h1>
     <div style='font-size:12.5px;color:var(--muted);margin-top:4px;'>
       当前监控网卡: <b id='curAdapter' style='color:#fff'>-</b> | 自动识别网段: <b id='curCidr' style='color:#a5a5ff'>-</b> | 网关: <b id='curGw'>-</b>
     </div>
@@ -2499,6 +2792,7 @@ tr:hover { background: rgba(56,189,248,0.08); }
 
 <!-- ==================== TAB 1: 综合监控视图 ==================== -->
 <div id='viewOverview' class='tab-pane-anim'>
+  <div id='dualNicBar' class='card hidden' style='margin-bottom:14px;border-color:rgba(108,108,245,0.45);background:linear-gradient(90deg,rgba(108,108,245,0.12),#1c1f26 45%);'></div>
   <div class='grid-4'>
     <div class='card'>
       <div class='card-label'>局域网健康评分</div>
@@ -2794,6 +3088,61 @@ function zoomTopo(factor) {
   topoZoom = Math.min(2.4, Math.max(0.45, topoZoom * factor));
 }
 
+async function toggleCrossWire() {
+  await fetch('/api/toggle-crosswire');
+  fetchStatus();
+}
+
+async function quickSwitchNic(id) {
+  await fetch('/api/switch?id=' + encodeURIComponent(id));
+  fetchStatus();
+}
+
+function renderDualNic(d) {
+  const bar = document.getElementById('dualNicBar');
+  if (!bar) return;
+  const dn = d.dualNic;
+  if (!dn || !dn.nics || dn.nics.length < 2) {
+    bar.classList.add('hidden');
+    return;
+  }
+  bar.classList.remove('hidden');
+  const leak = (!dn.sameSegment || dn.isolateCheck) && (dn.syncHits >= 3 || dn.sharedCount >= 1);
+  let statusBadge = '';
+  if (leak) {
+    statusBadge = `<span class='tag critical'>🚨 检测到双网段串线 (同帧碰撞 ${dn.syncHits} / 跨接MAC ${dn.sharedCount})</span>`;
+  } else if (dn.sameSegment && !dn.isolateCheck) {
+    statusBadge = `<span class='tag ok'>🔗 同网段双线模式 (主口+镜像口)</span>`;
+  } else {
+    statusBadge = `<span class='tag ok'>🛡️ 双物理网段完全隔离 (无串线)</span>`;
+  }
+  const vtInfo = dn.ignoredVirtual > 0 ? `<span style='font-size:11.5px;color:#9aa0a6;'>已自动隔离 ${dn.ignoredVirtual} 个虚拟网卡(ZeroTier/VPN)</span>` : '';
+  const cards = dn.nics.map(n => `
+    <div onclick='quickSwitchNic(""${n.id}"")' style='cursor:pointer;padding:8px 12px;border-radius:8px;border:1px solid ${n.active ? ""#6c6cf5"" : ""#2a2f3a""};background:${n.active ? ""rgba(108,108,245,0.18)"" : ""#14161a""};min-width:250px;flex:1;'>
+      <div style='display:flex;justify-content:space-between;align-items:center;gap:8px;font-size:12.5px;'>
+        <b style='color:#fff;'>${n.active ? '▶ ' : ''}${n.name}</b>
+        <span style='font-size:11px;color:#a5a5ff;'>${n.subnet || '侦听中'}</span>
+      </div>
+      <div style='font-size:12px;color:#9aa0a6;margin-top:4px;'>
+        速率: <b style='color:#e8eaed;'>${n.kbps} KB/s</b> (${n.pps} pps) | 发现MAC: <b style='color:#e8eaed;'>${n.macs}</b> | ${n.ip ? n.ip : '纯二层无IP'}
+      </div>
+    </div>
+  `).join('');
+  bar.innerHTML = `
+    <div style='display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px;margin-bottom:10px;'>
+      <div style='display:flex;align-items:center;gap:10px;flex-wrap:wrap;'>
+        <b style='font-size:13.5px;color:#fff;'>🔀 双物理网段并发监控 & 串线检测</b>
+        ${statusBadge}
+        ${vtInfo}
+      </div>
+      <button class='secondary' style='padding:4px 10px;font-size:12px;${dn.isolateCheck ? ""border-color:#6c6cf5;color:#a5a5ff;"" : """"}' onclick='toggleCrossWire()'>
+        ${dn.isolateCheck ? '🔒 物理隔离串线检测: 强制开启' : '🔓 物理隔离串线检测: 自动识别'}
+      </button>
+    </div>
+    <div style='display:flex;gap:10px;flex-wrap:wrap;'>${cards}</div>
+  `;
+}
+
 async function fetchStatus() {
   try {
     const r = await fetch('/api/status');
@@ -2806,6 +3155,7 @@ async function fetchStatus() {
 function renderStatus(d) {
   const verEl = document.getElementById('versionBadge');
   if (verEl && d.version) verEl.textContent = d.version;
+  renderDualNic(d);
   const badgeEl = document.getElementById('engineBadge');
   badgeEl.textContent = d.captureEngine;
   badgeEl.style.background = d.paused ? 'rgba(245,158,11,0.2)' : 'rgba(108,108,245,0.16)';
