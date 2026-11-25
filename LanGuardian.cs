@@ -268,7 +268,7 @@ namespace LanGuardian
 
     public class MonitorEngine
     {
-        public const string AppVersion = "v1.4.0";
+        public const string AppVersion = "v1.4.1";
         public List<AdapterInfo> Adapters = new List<AdapterInfo>();
         public AdapterInfo ActiveAdapter = new AdapterInfo();
         public List<string> IgnoredLocalSubnets = new List<string>();
@@ -1627,18 +1627,21 @@ namespace LanGuardian
                     string output = p.StandardOutput.ReadToEnd();
                     p.WaitForExit(3000);
                     var lines = output.Split(new[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries);
-                    bool inActiveInterfaceSection = string.IsNullOrEmpty(ActiveAdapter.Ip);
+                    // Determine physical interface IP to filter `arp -a` sections (avoid reading ZeroTier / VPN sections when active NIC is IP-less mirror)
+                    string targetArpIfaceIp = !string.IsNullOrEmpty(ActiveAdapter.Ip)
+                        ? ActiveAdapter.Ip
+                        : (Adapters.FirstOrDefault(a => !string.IsNullOrEmpty(a.Ip) && string.Equals(a.Cidr, ActiveCidr, StringComparison.OrdinalIgnoreCase))?.Ip
+                           ?? Adapters.FirstOrDefault(a => !string.IsNullOrEmpty(a.Ip))?.Ip
+                           ?? "");
+                    bool inActiveInterfaceSection = false;
 
                     foreach (var line in lines)
                     {
                         string trimmed = line.Trim();
-                        // Windows arp -a groups by "接口: 10.0.0.170 --- 0x5" or "Interface: 10.0.0.170 --- 0x5"
+                        // Windows arp -a groups by "接口: 10.0.0.179 --- 0x5" or "Interface: 10.0.0.179 --- 0x5"
                         if (trimmed.Contains("---") && (trimmed.Contains(":") || trimmed.StartsWith("Interface") || trimmed.StartsWith("接口")))
                         {
-                            if (!string.IsNullOrEmpty(ActiveAdapter.Ip))
-                            {
-                                inActiveInterfaceSection = trimmed.Contains(ActiveAdapter.Ip + " ");
-                            }
+                            inActiveInterfaceSection = !string.IsNullOrEmpty(targetArpIfaceIp) && trimmed.Contains(targetArpIfaceIp + " ");
                             continue;
                         }
                         if (!inActiveInterfaceSection) continue;
@@ -1667,7 +1670,7 @@ namespace LanGuardian
                             {
                                 uint ipU = IpToUint(ip);
                                 if (ipU == (SubnetNetUint | ~SubnetMaskUint)) continue; // skip subnet broadcast
-                                if (ip.EndsWith(".255")) continue;
+                                if (ip.EndsWith(".255") || ip == "25.255.255.254") continue;
                                 if (IsInOtherLocalAdapterSubnet(ip)) continue;
                                 GetOrAddHost(ip, NormalizeMac(mac));
                             }
@@ -2738,7 +2741,7 @@ tr:hover { background: rgba(56,189,248,0.08); }
 <body>
 <div class='header'>
   <div class='title-box'>
-    <h1>LanGuardian 局域网实时检测与故障诊断中心 <span id='versionBadge' class='badge-version'>v1.4.0</span> <span id='engineBadge' class='badge-engine'>加载中...</span></h1>
+    <h1>LanGuardian 局域网实时检测与故障诊断中心 <span id='versionBadge' class='badge-version'>v1.4.1</span> <span id='engineBadge' class='badge-engine'>加载中...</span></h1>
     <div style='font-size:12.5px;color:var(--muted);margin-top:4px;'>
       当前监控网卡: <b id='curAdapter' style='color:#fff'>-</b> | 自动识别网段: <b id='curCidr' style='color:#a5a5ff'>-</b> | 网关: <b id='curGw'>-</b>
     </div>
