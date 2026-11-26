@@ -268,7 +268,117 @@ namespace LanGuardian
 
     public class MonitorEngine
     {
-        public const string AppVersion = "v1.4.2";
+        public const string AppVersion = "v1.5.0";
+        public string LogDirectory = "";
+        private readonly object _logLock = new object();
+        private readonly ConcurrentDictionary<string, DateTime> _lastAlertLogTime = new ConcurrentDictionary<string, DateTime>();
+        private int _summaryTick = 0;
+
+        private string ResolveLogDirectory()
+        {
+            try
+            {
+                string docs = Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments);
+                // When running as Windows Scheduled Task under SYSTEM, MyDocuments points to systemprofile; locate real user's Documents folder
+                if (string.IsNullOrEmpty(docs) || docs.IndexOf("systemprofile", StringComparison.OrdinalIgnoreCase) >= 0)
+                {
+                    string usersRoot = @"C:\Users";
+                    if (Directory.Exists(usersRoot))
+                    {
+                        foreach (var dir in Directory.GetDirectories(usersRoot))
+                        {
+                            string name = Path.GetFileName(dir);
+                            if (string.Equals(name, "Public", StringComparison.OrdinalIgnoreCase) ||
+                                string.Equals(name, "Default", StringComparison.OrdinalIgnoreCase) ||
+                                string.Equals(name, "Default User", StringComparison.OrdinalIgnoreCase) ||
+                                string.Equals(name, "All Users", StringComparison.OrdinalIgnoreCase)) continue;
+                            string cand = Path.Combine(dir, "Documents");
+                            if (Directory.Exists(cand))
+                            {
+                                docs = cand;
+                                break;
+                            }
+                        }
+                    }
+                }
+                if (string.IsNullOrEmpty(docs))
+                {
+                    docs = AppDomain.CurrentDomain.BaseDirectory;
+                }
+                string logDir = Path.Combine(docs, "LanGuardianLogs");
+                Directory.CreateDirectory(logDir);
+                return logDir;
+            }
+            catch
+            {
+                string fallback = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "LanGuardianLogs");
+                try { Directory.CreateDirectory(fallback); } catch { }
+                return fallback;
+            }
+        }
+
+        public void WriteLog(string level, string message)
+        {
+            try
+            {
+                if (string.IsNullOrEmpty(LogDirectory)) LogDirectory = ResolveLogDirectory();
+                string fileName = "LanGuardian_" + DateTime.Now.ToString("yyyy-MM-dd") + ".log";
+                string fullPath = Path.Combine(LogDirectory, fileName);
+                string line = string.Format("[{0}] [{1}] {2}{3}",
+                    DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss"),
+                    level,
+                    message,
+                    Environment.NewLine);
+                lock (_logLock)
+                {
+                    if (!File.Exists(fullPath))
+                    {
+                        File.WriteAllText(fullPath, "\uFEFF# LanGuardian 局域网实时监控日志 (" + DateTime.Now.ToString("yyyy-MM-dd") + ") - " + AppVersion + Environment.NewLine, Encoding.UTF8);
+                    }
+                    File.AppendAllText(fullPath, line, Encoding.UTF8);
+                }
+            }
+            catch { }
+        }
+
+        public List<string> ListLogDates()
+        {
+            var dates = new List<string>();
+            try
+            {
+                if (string.IsNullOrEmpty(LogDirectory)) LogDirectory = ResolveLogDirectory();
+                if (Directory.Exists(LogDirectory))
+                {
+                    foreach (var f in Directory.GetFiles(LogDirectory, "LanGuardian_*.log"))
+                    {
+                        string fn = Path.GetFileNameWithoutExtension(f);
+                        if (fn.Length > 12) dates.Add(fn.Substring(12));
+                    }
+                }
+                dates.Sort((a, b) => string.Compare(b, a, StringComparison.Ordinal));
+            }
+            catch { }
+            return dates;
+        }
+
+        public string ReadLogByDate(string dateStr, int maxLines = 400)
+        {
+            try
+            {
+                if (string.IsNullOrEmpty(dateStr) || dateStr.IndexOfAny(new[] { '/', '\\', '.' }) >= 0) return "";
+                if (string.IsNullOrEmpty(LogDirectory)) LogDirectory = ResolveLogDirectory();
+                string fullPath = Path.Combine(LogDirectory, "LanGuardian_" + dateStr + ".log");
+                if (!File.Exists(fullPath)) return "";
+                string[] all;
+                lock (_logLock) { all = File.ReadAllLines(fullPath, Encoding.UTF8); }
+                if (maxLines > 0 && all.Length > maxLines)
+                {
+                    return string.Join("\n", all.Skip(all.Length - maxLines));
+                }
+                return string.Join("\n", all);
+            }
+            catch { return ""; }
+        }
         public List<AdapterInfo> Adapters = new List<AdapterInfo>();
         public AdapterInfo ActiveAdapter = new AdapterInfo();
         public List<string> IgnoredLocalSubnets = new List<string>();
@@ -382,6 +492,7 @@ namespace LanGuardian
 
         public void Start(string preferredIpOrAdapter)
         {
+            LogDirectory = ResolveLogDirectory();
             if (string.IsNullOrEmpty(preferredIpOrAdapter))
             {
                 preferredIpOrAdapter = LoadSavedAdapterPreference();
@@ -390,6 +501,8 @@ namespace LanGuardian
             DetectNpcap();
             RefreshAdapters();
             SelectBestAdapter(_preferredAdapterHint);
+            WriteLog("INFO", string.Format("LanGuardian {0} 启动成功 | 日志目录: {1} | 活动网卡: {2} ({3}) | 网段: {4}",
+                AppVersion, LogDirectory, ActiveAdapter.Name, ActiveAdapter.Ip, ActiveCidr));
 
             _running = true;
             Task.Run(() => TickerLoop());
@@ -657,6 +770,7 @@ namespace LanGuardian
 
         public void ResetAllStats()
         {
+            WriteLog("INFO", "用户执行【重置显示数据】（仅清空前端实时展示缓存，按天日志文件完整保留）");
             Hosts.Clear();
             Alerts.Clear();
             ActiveLinks.Clear();
@@ -1300,6 +1414,53 @@ namespace LanGuardian
                         ns.KBps = Math.Round(wb / 1024.0, 1);
                     }
                     EvaluateCrossWireLeak();
+
+                    // Real-time aging: auto-expire stale alerts (>180s without recurrence) and gone rogue/offline hosts
+                    var nowDt = DateTime.Now;
+                    foreach (var alKv in Alerts.ToArray())
+                    {
+                        if ((nowDt - alKv.Value.LastTime).TotalSeconds > 180)
+                        {
+                            AnomalyAlert removedAl;
+                            if (Alerts.TryRemove(alKv.Key, out removedAl))
+                            {
+                                WriteLog("RECOVER", string.Format("告警已自动消退(超过3分钟未复发): [{0}] {1} | 节点: {2} | 历史累计: {3} 次",
+                                    removedAl.Code, removedAl.Title, removedAl.TargetIp, removedAl.Count));
+                            }
+                        }
+                    }
+                    foreach (var hKv in Hosts.ToArray())
+                    {
+                        var hh = hKv.Value;
+                        double idleSec = (nowDt - hh.LastSeen).TotalSeconds;
+                        // Foreign/cross-subnet rogue nodes vanish from live topology after 180s of silence; normal LAN hosts after 900s
+                        if (!hh.IsLocalSubnet && idleSec > 180)
+                        {
+                            HostStats removedH;
+                            if (Hosts.TryRemove(hKv.Key, out removedH))
+                            {
+                                WriteLog("RECOVER", string.Format("跨网段异常节点已静默超时移除(超过3分钟无新报文): {0} [{1} {2}]",
+                                    removedH.Ip, removedH.Mac, removedH.Vendor));
+                            }
+                        }
+                        else if (hh.IsLocalSubnet && !hh.IsGateway && !LocalHostIps.Contains(hh.Ip) && idleSec > 900)
+                        {
+                            HostStats removedH;
+                            Hosts.TryRemove(hKv.Key, out removedH);
+                        }
+                    }
+
+                    // Periodic 5-minute health snapshot in daily log
+                    _summaryTick++;
+                    if (_summaryTick >= 300)
+                    {
+                        _summaryTick = 0;
+                        int critN = Alerts.Values.Count(a => a.Severity == "critical");
+                        int warnN = Alerts.Values.Count(a => a.Severity == "warning");
+                        int sc = Math.Max(20, 100 - critN * 22 - warnN * 8);
+                        WriteLog("SUMMARY", string.Format("5分钟巡检快照 | 健康分: {0} | 活跃节点: {1} | 实时速率: {2:F1} KB/s ({3:F0} pps) | 网关延迟: {4:F1}ms | 外网延迟: {5:F1}ms | 活跃告警: {6}",
+                            sc, Hosts.Count, CurrentTotalKBps, CurrentTotalPps, GatewayLatencyMs, WanLatencyMs, Alerts.Count));
+                    }
 
                     // Update active flow link rates and prune stale links (>45s)
                     var linkCutoff = DateTime.Now.AddSeconds(-45);
@@ -1999,7 +2160,9 @@ namespace LanGuardian
 
         private void RaiseAlert(string id, string code, string severity, string title, string ip, string mac, string vendor, string evidence, string cause, string fixGen, string fixWayos, string fixTplink)
         {
-            Alerts.AddOrUpdate(id,
+            bool isNew = !Alerts.ContainsKey(id);
+            var now = DateTime.Now;
+            var alObj = Alerts.AddOrUpdate(id,
                 k => new AnomalyAlert
                 {
                     Id = id,
@@ -2014,19 +2177,28 @@ namespace LanGuardian
                     FixGeneral = fixGen,
                     FixWayOS = fixWayos,
                     FixTpLink = fixTplink,
-                    FirstTime = DateTime.Now,
-                    LastTime = DateTime.Now,
+                    FirstTime = now,
+                    LastTime = now,
                     Count = 1
                 },
                 (k, old) =>
                 {
-                    old.LastTime = DateTime.Now;
+                    old.LastTime = now;
                     old.Count++;
                     old.Evidence = evidence;
                     if (!string.IsNullOrEmpty(mac)) old.TargetMac = mac;
                     if (!string.IsNullOrEmpty(vendor)) old.TargetVendor = vendor;
                     return old;
                 });
+
+            DateTime lastLogged;
+            if (isNew || !_lastAlertLogTime.TryGetValue(id, out lastLogged) || (now - lastLogged).TotalSeconds >= 300)
+            {
+                _lastAlertLogTime[id] = now;
+                WriteLog(severity == "critical" ? "CRIT" : "WARN",
+                    string.Format("[{0}] {1} | 节点: {2} [{3} {4}] | 累计: {5}次 | 证据: {6}",
+                        code, title, ip, mac, vendor, alObj.Count, evidence));
+            }
         }
 
         // Helpers
@@ -2329,6 +2501,34 @@ namespace LanGuardian
                         {
                             _engine.IsolateCrossWireCheck = !_engine.IsolateCrossWireCheck;
                             SendJson(stream, "{\"ok\":true,\"isolate\":" + (_engine.IsolateCrossWireCheck ? "true" : "false") + "}");
+                        }
+                        else if (path == "/api/logs")
+                        {
+                            var dates = _engine.ListLogDates();
+                            var lsb = new StringBuilder();
+                            lsb.Append("{\"logDir\":\"");
+                            lsb.Append(Esc(_engine.LogDirectory));
+                            lsb.Append("\",\"dates\":[");
+                            for (int i = 0; i < dates.Count; i++)
+                            {
+                                if (i > 0) lsb.Append(",");
+                                lsb.Append("\"" + Esc(dates[i]) + "\"");
+                            }
+                            lsb.Append("]}");
+                            SendJson(stream, lsb.ToString());
+                        }
+                        else if (path == "/api/log-file")
+                        {
+                            var q = ParseQuery(query);
+                            string dateStr = q.ContainsKey("date") ? q["date"] : DateTime.Now.ToString("yyyy-MM-dd");
+                            bool dl = q.ContainsKey("download") && q["download"] == "1";
+                            string content = _engine.ReadLogByDate(dateStr, dl ? 0 : 400);
+                            byte[] body = Encoding.UTF8.GetBytes(content);
+                            string disp = dl ? ("Content-Disposition: attachment; filename=\"LanGuardian_" + dateStr + ".log\"\r\n") : "";
+                            string hdr = "HTTP/1.1 200 OK\r\nContent-Type: text/plain; charset=utf-8\r\n" + disp + "Cache-Control: no-cache\r\nContent-Length: " + body.Length + "\r\nConnection: close\r\n\r\n";
+                            byte[] hdrBytes = Encoding.ASCII.GetBytes(hdr);
+                            stream.Write(hdrBytes, 0, hdrBytes.Length);
+                            stream.Write(body, 0, body.Length);
                         }
                         else if (path == "/api/reset-all")
                         {
@@ -2755,7 +2955,7 @@ tr:hover { background: rgba(56,189,248,0.08); }
 <body>
 <div class='header'>
   <div class='title-box'>
-    <h1>LanGuardian 局域网实时检测与故障诊断中心 <span id='versionBadge' class='badge-version'>v1.4.2</span> <span id='engineBadge' class='badge-engine'>加载中...</span></h1>
+    <h1>LanGuardian 局域网实时检测与故障诊断中心 <span id='versionBadge' class='badge-version'>v1.5.0</span> <span id='engineBadge' class='badge-engine'>加载中...</span></h1>
     <div style='font-size:12.5px;color:var(--muted);margin-top:4px;'>
       当前监控网卡: <b id='curAdapter' style='color:#fff'>-</b> | 自动识别网段: <b id='curCidr' style='color:#a5a5ff'>-</b> | 网关: <b id='curGw'>-</b>
     </div>
@@ -2934,10 +3134,22 @@ tr:hover { background: rgba(56,189,248,0.08); }
 <div id='viewAlerts' class='hidden'>
   <div class='card' style='margin-bottom:16px;'>
     <div class='section-title'>
-      <span>🚨 实时抓包异常诊断与修正意见列表</span>
-      <button class='secondary' style='padding:4px 10px;font-size:12px;' onclick='clearAlerts()'>清空历史告警</button>
+      <span>🚨 实时抓包异常诊断与修正意见列表 (超过 3 分钟未复发将自动消退并记入每日日志)</span>
+      <button class='secondary' style='padding:4px 10px;font-size:12px;' onclick='clearAlerts()'>清空当前告警</button>
     </div>
     <div id='alertContainerFull' class='alert-list' style='margin-bottom:0;'></div>
+  </div>
+
+  <div class='card' style='margin-bottom:16px;'>
+    <div class='section-title'>
+      <span>📜 每日持久化流水日志 <span id='logDirHint' style='font-size:12px;font-weight:400;color:var(--muted);'></span></span>
+      <div style='display:flex;align-items:center;gap:8px;flex-wrap:wrap;'>
+        <select id='logDateSel' onchange='loadLogContent()' style='padding:4px 10px;font-size:12px;'></select>
+        <button class='secondary' style='padding:4px 10px;font-size:12px;' onclick='loadLogDates(true)'>刷新日志</button>
+        <button style='padding:4px 10px;font-size:12px;' onclick='downloadSelectedLog()'>⬇ 下载当天完整 Log</button>
+      </div>
+    </div>
+    <pre id='logViewer' class='mono' style='background:#14161a;border:1px solid var(--border);border-radius:8px;padding:12px;max-height:300px;overflow:auto;font-size:12px;color:#cbd5e1;white-space:pre-wrap;line-height:1.55;'>正在加载日志...</pre>
   </div>
 
   <div class='card'>
@@ -3081,6 +3293,43 @@ function switchTab(tab) {
       fitTopologyToView();
     });
   }
+  if (tab === 'alerts') {
+    loadLogDates(true);
+  }
+}
+
+async function loadLogDates(alsoLoadContent) {
+  try {
+    const r = await fetch('/api/logs');
+    const d = await r.json();
+    const hint = document.getElementById('logDirHint');
+    if (hint && d.logDir) hint.textContent = '(保存路径: ' + d.logDir + '，重置数据不影响日志)';
+    const sel = document.getElementById('logDateSel');
+    if (sel && d.dates) {
+      const prev = sel.value;
+      sel.innerHTML = d.dates.map(dt => `<option value='${dt}'>${dt} 日志</option>`).join('');
+      if (prev && d.dates.includes(prev)) sel.value = prev;
+      if (alsoLoadContent) loadLogContent();
+    }
+  } catch (e) {}
+}
+
+async function loadLogContent() {
+  const sel = document.getElementById('logDateSel');
+  const pre = document.getElementById('logViewer');
+  if (!sel || !pre || !sel.value) return;
+  try {
+    const r = await fetch('/api/log-file?date=' + encodeURIComponent(sel.value));
+    const txt = await r.text();
+    pre.textContent = txt || '(当天暂无日志记录)';
+    pre.scrollTop = pre.scrollHeight;
+  } catch (e) {}
+}
+
+function downloadSelectedLog() {
+  const sel = document.getElementById('logDateSel');
+  if (!sel || !sel.value) return;
+  window.open('/api/log-file?date=' + encodeURIComponent(sel.value) + '&download=1', '_blank');
 }
 
 function fitTopologyToView() {
