@@ -1,37 +1,103 @@
-# LanGuardian - Windows 局域网实时状况检测、异常节点定位与修正诊断工具
+# LanGuardian (`v1.5.0`)
+
+**Windows 局域网实时状况检测、交互式网络拓扑透视、双物理网段串线排查与自动化故障诊断中心**
+
+`LanGuardian` 是一个零外部运行时依赖的单文件 Windows 可执行程序（`LanGuardian.exe`，约 200KB），基于 C# 与 Npcap / Windows RawSocket 底层抓包引擎构建，不写死任何固定网段，适用于企业办公网、门店及多分支局域网的日常体检、端口镜像全网流量透视与故障溯源。
+
+---
 
 ## 1. 核心特性
-- **单文件 `.exe` 独立运行**：`LanGuardian.exe` 仅 77KB，无需安装 Python、Go 或额外运行时，在任意 Windows 10 / 11 上开箱即用。
-- **普适自适应任意网段（不写死 IP）**：
-  - 启动时自动枚举所有网卡，动态计算当前网段 CIDR（无论 `10.0.0.0/24`、`192.168.1.0/24`、`172.16.0.0/16` 等）、默认网关与 DNS。
-  - 支持在 Web 界面右上角随时**切换监控网卡**（如切换到插在路由器 `LAN4` 端口镜像口上的专用抓包网卡）或自定义监控网段。
-- **双模混杂抓包引擎 + 主动探测**：
-  - **模式 1（推荐，支持交换机/路由器端口镜像全量二层抓包）**：自动检测并加载 **Npcap (`wpcap.dll`)**，在二层混杂模式下捕获所有以太网帧（ARP、VLAN、DHCP、TCP、UDP、DNS、mDNS、TLS SNI、HTTP Host、广播风暴）。
-  - **模式 2（零驱动开箱即用）**：即使未安装 Npcap，右键以管理员身份运行时也会自动启用 **Windows 原生 `RawSocket (SIO_RCVALL)` 混杂抓包引擎 + 内核 ARP 表轮询 (`SendARP`)**。
-- **内置 10 类异常检测 + 自动修正意见（含通用、维盟 WayOS、TP-LINK 商用路由落地方案）**：
-  1. **私接路由器 / 非法 DHCP 抢答 (`ROGUE_DHCP`)**
-  2. **跨网段异常节点窜入 (`CROSS_SUBNET`，如 `192.168.0.1` 混入 `10.0.0.0/24`)**
-  3. **ARP 欺骗 / IP 地址冲突 (`ARP_CONFLICT`，同一 IP 对应多个 MAC)**
-  4. **广播风暴 / 高频 ARP 扫描 (`BROADCAST_STORM`)**
-  5. **突发大流量尖峰 (`TRAFFIC_BURST`，滑动窗口 + EWMA 动态基线 + 自动提取正在访问的域名/SNI/端口)**
-  6. **单机连接数/SYN 洪泛 (`CONN_FLOOD`，P2P 迅雷或异常高并发打满 NAT 表)**
-  7. **内网横向端口扫描 (`PORT_SCAN`)**
-  8. **高 TCP 重传率 / 零窗口 (`HIGH_RETRANSMIT`，定位劣质网线或百兆小路由瓶颈)**
-  9. **内网网关劣化 (`GATEWAY_DEGRADED`，区分内网堵死 vs 外网宽带慢)**
-  10. **外网宽带出口抖动 (`WAN_DEGRADED`)**
 
-## 2. 使用方法
-1. 将 [LanGuardian.exe](file:///Users/mandoli/.gemini/antigravity/scratch/LanGuardian/LanGuardian.exe)（及可选的 [启动局域网检测(管理员).bat](file:///Users/mandoli/.gemini/antigravity/scratch/LanGuardian/启动局域网检测(管理员).bat)）复制到 Windows 监控电脑。
-2. 右键 **`LanGuardian.exe`** -> **以管理员身份运行**（或直接双击 `启动局域网检测(管理员).bat`）。
-3. 程序会自动在浏览器打开可视化诊断面板：`http://127.0.0.1:8088`（局域网其他电脑也可通过 `http://<监控机IP>:8088` 访问）。
-4. 若需配合维盟 `IBR-740` 或 TP-LINK `TL-R476G+` 的**端口镜像口**抓全网二层流量，建议在 Windows 上安装免费开源的 [Npcap](https://npcap.com/)（安装时勾选 `Install Npcap in WinPcap API-compatible Mode`）。
+### 抓包与双物理网卡并发监测
+* **单文件零依赖**：单一 `LanGuardian.exe` 开箱即用，无需安装 Python、Node.js 或第三方数据库，内置轻量级 HTTP 控制台（默认端口 `8088`，监听全地址 `0.0.0.0:8088`）。
+* **纯二层无 IP 镜像口自动适配**：支持双网卡“主网口管理 + 副网口禁用 IPv4/IPv6 作为纯二层静默抓包口（Span Port）”的标准探针架构，启动后自动通过 Npcap 枚举并优先选中在线镜像口，同时自动从主网口继承目标网段 CIDR 与网关，并持久化记忆网卡选择（`LanGuardian.cfg`）。
+* **双物理网段并发监控 & 物理串线检测（`CROSS_WIRE_LEAK`）**：当机器接入两块物理网卡时，后台并发监听两路二层流量，顶部实时展示两张网卡的吞吐率、包速率、发现 MAC 数与观测网段；自动区分“同网段主口+镜像口”与“双物理隔离网段”，也支持手动锁定 **🔒 物理隔离串线检测**，通过 **200ms 同帧碰撞** 与 **双边同现非本机 MAC** 实时揪出物理串线。
+* **端口镜像重复帧去重 & 精准重传剥离**：内置 1024 槽位 / 100ms 报文指纹环形去重缓存，彻底消除多口镜像带来的重复计数与假重传；将局域网内网物理链路重传与外网/跨境重传、探针 `8088` 管理端口流量彻底剥离，避免检测设备自身干扰检测结果。
+* **虚拟网卡（ZeroTier / VPN）彻底隔离**：内置虚拟网卡黑名单（`ZeroTier / Tailscale / WireGuard / TAP / Hyper-V / VMware / VirtualBox / OpenVPN` 等），并严格限定 `arp -a` 仅解析物理网卡分组，安装 ZeroTier 实现异地远程访问时零干扰、零误报。
 
-## 3. 重新编译命令（如需修改源码 `LanGuardian.cs`）
-- **在 Windows 上（无需安装任何工具，使用系统自带编译器）**：
+### 实时态势、交互式拓扑与每日持久化日志
+* **深色凹角滑块现代界面**：提供 **「📊 实时监控与故障诊断」**、**「🕸️ 网络拓扑与实时态势图」**、**「🚨 异常诊断与修正方案」** 三大视图，活跃节点表格支持按主要列标题点击排序。
+* **交互式网络拓扑图（全屏 + 自适应 + 声波告警 + 防跳动）**：
+  * 支持分层架构 / 星型通信态势两种布局、实时带宽动态粒子流、内网 P2P 会话连线、滚轮缩放与节点拖拽；
+  * 支持 **⛶ 全屏模式** 并自动计算全部节点包围盒（`fitTopologyToView`），让节点刚刚好完整居中显示；
+  * 严重异常节点显示 **3 层放射状声波红圈动画**（警告节点 2 层橙色声波），节点按“角色 + IP 数值”确定性锁定坐标，刷新时绝不跳动。
+* **实时状态自动消退 + 按天持久化日志**：
+  * 告警超过 **3 分钟**未复发自动消退并记入 `[RECOVER]` 日志；跨网段异常节点静默 **3 分钟**自动从实时拓扑移除，普通离线终端 **15 分钟**自动老化隐藏。
+  * 自动按天生成 UTF-8 日志文件 `LanGuardian_YYYY-MM-DD.log`（优先存入用户“文档”目录下的 `LanGuardianLogs` 子目录，支持每 5 分钟巡检快照、告警首次/持续汇总与恢复记录）；点击页面 **「🔄 重置数据」** 仅清空前端展示缓存，历史日志完整保留，并支持在网页端按日期直接在线查阅与下载。
+
+---
+
+## 2. 内置异常检测能力（附通用 / 维盟 WayOS / TP-LINK 修正建议）
+
+1. **私接路由器 / 非法 DHCP 抢答** (`ROGUE_DHCP`)
+2. **跨网段异常节点窜入** (`CROSS_SUBNET`，定位私接 LAN 口直插的小路由器如 `192.168.0.1` / `192.168.3.1`)
+3. **双物理网段串线 / 二层泄露** (`CROSS_WIRE_LEAK`)
+4. **ARP 欺骗 / IP 地址冲突** (`ARP_CONFLICT`，已排除镜像模式下网关 MAC 误关联)
+5. **广播风暴 / 高频 ARP 扫描** (`BROADCAST_STORM`，已豁免探针本机物理 IP)
+6. **突发大流量尖峰** (`TRAFFIC_BURST`，EWMA 动态基线 + 自动提取正在访问的 HTTP Host / TLS SNI)
+7. **单机新建连接洪泛** (`CONN_FLOOD`，揪出打满 NAT 会话表的 P2P / 扫描主机)
+8. **内网横向端口扫描** (`PORT_SCAN`)
+9. **内网物理链路丢包重传偏高** (`HIGH_RETRANSMIT`，仅统计内网物理链路，恢复后自动消退)
+10. **终端接收缓冲满 / TCP 零窗口** (`TCP_ZERO_WINDOW`)
+11. **内网网关劣化 (`GATEWAY_DEGRADED`) 与外网出口抖动 (`WAN_DEGRADED`)**（自动探测双层 NAT 并区分内网拥塞还是外网慢）
+
+---
+
+## 3. 部署与使用指南
+
+### 快速启动（单网卡 / 本地使用）
+1. 将 [`LanGuardian.exe`](./LanGuardian.exe)、[`启动局域网检测(管理员).bat`](./启动局域网检测(管理员).bat) 与 [`停止局域网检测(管理员).bat`](./停止局域网检测(管理员).bat) 复制到 Windows 监控主机。
+2. 右键以管理员身份运行 `LanGuardian.exe`（或双击 `启动局域网检测(管理员).bat`）。
+3. 浏览器打开 `http://127.0.0.1:8088/`（局域网内访问 `http://<监控机IP>:8088/`）。
+
+### 推荐架构：双网卡纯二层镜像探针 + ZeroTier 异地访问
+1. **安装 Npcap**：在监控机安装 [Npcap](https://npcap.com/)（勾选 `WinPcap API-compatible Mode`）。
+2. **配置双网卡**：
+   * **主网卡（`以太网`）**：接普通 LAN 口获取内网 IP，用于上网、Ping 探测、网页展示及 ZeroTier 远程隧道；
+   * **副网卡（`以太网 2`）**：在网卡属性中**取消勾选 IPv4 与 IPv6**（仅保留 `Npcap Packet Driver`），使其成为纯二层静默抓包口，网线直连路由器的镜像口。
+3. **路由器端口镜像配置要点**：
+   * **维盟 WayOS**：【端口管理】→【端口镜像】→ 选择自定义高级设置 → 镜像目的口选空闲 LAN 口（如端口 4），被镜像源口选其他 LAN 口（双向），**不要勾选 WAN 口**。
+   * **TP-LINK 商用路由**：【高级功能】→【端口监控】→ 监控口选副网卡所插端口，被监控口只勾选连接内网交换机的 LAN 口，**不要勾选 WAN 口**（防止 WAN 侧地址污染内网统计）。
+4. **ZeroTier 远程访问**：在监控机安装 ZeroTier One 并加入私有网络后，直接通过 `http://<ZeroTier虚拟IP>:8088/` 即可随时异地访问监控面板与每日日志，无需公网 IP 或端口映射。
+
+---
+
+## 4. 常用 HTTP API
+
+| 接口路径 | 说明 |
+| :--- | :--- |
+| `GET /api/status` | 获取实时监控全景 JSON（版本、健康分、双网卡状态、告警、活跃节点、拓扑连线） |
+| `GET /api/switch?id=<网卡ID>&cidr=<可选CIDR>` | 切换当前主抓包网卡并持久化保存到 `LanGuardian.cfg` |
+| `GET /api/toggle-pause` | 暂停 / 恢复抓包监控 |
+| `GET /api/toggle-crosswire` | 切换“物理隔离串线检测”自动识别 / 强制开启模式 |
+| `GET /api/scan` | 手动触发一次温和限速的局域网 ARP 发现扫描 |
+| `GET /api/clear-alerts` | 清空当前页面告警（不影响历史日志文件） |
+| `GET /api/reset-all` | 重置前端实时统计缓存（不影响历史日志文件） |
+| `GET /api/logs` | 列出所有已落盘的按天日志日期与存储目录 |
+| `GET /api/log-file?date=YYYY-MM-DD[&download=1]` | 在线读取或下载指定日期的完整流水日志 |
+
+---
+
+## 5. 从源码编译
+
+* **Windows 本机（无需额外安装 SDK，使用系统自带 .NET 编译器）**：
   ```cmd
   C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe /optimize+ /out:LanGuardian.exe LanGuardian.cs
   ```
-- **在当前 Mac 上交叉编译**：
+* **macOS / Linux（使用 .NET SDK 内置 Roslyn 交叉编译）**：
   ```bash
   /usr/local/share/dotnet/dotnet /usr/local/share/dotnet/sdk/9.0.102/Roslyn/bincore/csc.dll -nologo -optimize+ -target:exe -platform:anycpu -nostdlib -r:/usr/local/share/dotnet/sdk/9.0.102/ref/mscorlib.dll -r:/usr/local/share/dotnet/sdk/9.0.102/ref/netstandard.dll -out:LanGuardian.exe LanGuardian.cs
   ```
+
+---
+
+## 6. 版本更新日志（Changelog）
+
+* **`v1.5.0`**：新增实时告警与跨网段异常节点 3 分钟自动消退机制；新增按天持久化日志文件（存放在用户 `Documents\LanGuardianLogs` 目录），支持网页端按日期在线预览与下载，重置前端数据不丢失历史流水。
+* **`v1.4.2`**：拓扑图新增全屏模式与 `fitTopologyToView()` 自动适配区域显示；异常节点升级为放射状声波红圈/橙圈动画；端点按“角色 + IP”确定性锁定坐标，彻底消除节点跳动。
+* **`v1.4.1`**：严格限定 `arp -a` 解析仅读取物理网卡分组并过滤 `25.255.255.254` 等 ZeroTier 虚拟地址。
+* **`v1.4.0`**：新增双物理网卡并发监测面板与实时物理串线检测（`CROSS_WIRE_LEAK`）；加固虚拟网卡（ZeroTier / VPN）黑名单隔离；镜像模式下关闭周期性全网 ARP 扫盘并改为温和限速，消除探针自身误报。
+* **`v1.3.1`**：将物理链路重传统计严格限定为局域网内网互访报文（剥离外网丢包与探针 `8088` 端口自环流量），并支持重传恢复后自动解除告警。
+* **`v1.3.0`**：新增 1024 槽位 / 100ms 端口镜像重复帧去重；界面新增版本号徽章并全面升级为深炭黑 + 凹角滑块 Tab 导航风格。
+* **`v1.2.x`**：支持禁用 IPv4/IPv6 的纯二层无 IP 镜像网卡自动识别与选择持久化；排除网关 MAC 误关联导致的 `ARP_CONFLICT` 误报；修复零窗口误报重传与拓扑图首次进入变形问题，增加表格按列排序。
+* **`v1.0.0`**：首个单文件独立运行版本，实现 Npcap/RawSocket 双模抓包、10 类局域网异常诊断与交互式拓扑图。
