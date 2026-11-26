@@ -268,7 +268,7 @@ namespace LanGuardian
 
     public class MonitorEngine
     {
-        public const string AppVersion = "v1.4.1";
+        public const string AppVersion = "v1.4.2";
         public List<AdapterInfo> Adapters = new List<AdapterInfo>();
         public AdapterInfo ActiveAdapter = new AdapterInfo();
         public List<string> IgnoredLocalSubnets = new List<string>();
@@ -2713,6 +2713,20 @@ canvas#trafficCanvas { width: 100%; height: 140px; display: block; }
 /* Topology Tab Layout */
 .topo-wrapper { display: grid; grid-template-columns: 1fr 330px; gap: 14px; align-items: stretch; }
 @media (max-width: 1024px) { .topo-wrapper { grid-template-columns: 1fr; } }
+.topo-wrapper:fullscreen, .topo-wrapper:-webkit-full-screen, .topo-wrapper.topo-fs-fallback {
+  position: fixed !important; inset: 0 !important; width: 100vw !important; height: 100vh !important;
+  z-index: 9999 !important; background: #14161a !important; padding: 12px !important; margin: 0 !important;
+  grid-template-columns: 1fr 340px !important;
+}
+.topo-wrapper:fullscreen .topo-stage, .topo-wrapper:-webkit-full-screen .topo-stage, .topo-wrapper.topo-fs-fallback .topo-stage {
+  min-height: 0 !important; height: 100% !important;
+}
+.topo-wrapper:fullscreen canvas#topoCanvas, .topo-wrapper:-webkit-full-screen canvas#topoCanvas, .topo-wrapper.topo-fs-fallback canvas#topoCanvas {
+  height: 100% !important;
+}
+.topo-wrapper:fullscreen .inspector-card, .topo-wrapper:-webkit-full-screen .inspector-card, .topo-wrapper.topo-fs-fallback .inspector-card {
+  height: 100% !important; overflow-y: auto !important;
+}
 .topo-stage { background: radial-gradient(circle at 50% 35%, #1d2033 0%, #14161a 85%); border: 1px solid var(--border); border-radius: 12px; position: relative; overflow: hidden; min-height: 620px; display: flex; flex-direction: column; }
 .topo-toolbar { display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 8px; padding: 10px 14px; background: rgba(20,22,26,0.88); border-bottom: 1px solid var(--border); z-index: 2; }
 .topo-legend { display: flex; flex-wrap: wrap; gap: 12px; padding: 8px 14px; background: rgba(20,22,26,0.82); border-top: 1px solid var(--border); font-size: 12px; color: var(--muted); z-index: 2; }
@@ -2741,7 +2755,7 @@ tr:hover { background: rgba(56,189,248,0.08); }
 <body>
 <div class='header'>
   <div class='title-box'>
-    <h1>LanGuardian 局域网实时检测与故障诊断中心 <span id='versionBadge' class='badge-version'>v1.4.1</span> <span id='engineBadge' class='badge-engine'>加载中...</span></h1>
+    <h1>LanGuardian 局域网实时检测与故障诊断中心 <span id='versionBadge' class='badge-version'>v1.4.2</span> <span id='engineBadge' class='badge-engine'>加载中...</span></h1>
     <div style='font-size:12.5px;color:var(--muted);margin-top:4px;'>
       当前监控网卡: <b id='curAdapter' style='color:#fff'>-</b> | 自动识别网段: <b id='curCidr' style='color:#a5a5ff'>-</b> | 网关: <b id='curGw'>-</b>
     </div>
@@ -2887,6 +2901,7 @@ tr:hover { background: rgba(56,189,248,0.08); }
           <button class='secondary' onclick='zoomTopo(1.18)' title='放大'>＋</button>
           <button class='secondary' onclick='zoomTopo(0.85)' title='缩小'>－</button>
           <button class='secondary' onclick='resetTopoView()'>重置视图与布局</button>
+          <button id='btnTopoFs' class='secondary' onclick='toggleTopoFullscreen()' title='进入/退出全屏视图' style='border-color:#6c6cf5;color:#c7c7ff;'>⛶ 全屏模式</button>
         </div>
       </div>
 
@@ -3058,15 +3073,88 @@ function switchTab(tab) {
     requestAnimationFrame(() => {
       const sizeChanged = resizeTopoCanvas();
       if (sizeChanged) {
-        // Clear unpinned positions that were computed while canvas was hidden
         Object.keys(nodePositions).forEach(k => {
           if (!nodePositions[k].pinned) delete nodePositions[k];
         });
       }
       rebuildTopologyGraph(lastStatus);
+      fitTopologyToView();
     });
   }
 }
+
+function fitTopologyToView() {
+  if (!topoGraphNodes || topoGraphNodes.length === 0) return;
+  const W = topoLogicW, H = topoLogicH;
+  if (W < 100 || H < 100) return;
+  let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
+  topoGraphNodes.forEach(n => {
+    const padX = Math.max(n.radius + 48, 66);
+    const padTop = n.radius + 26;
+    const padBot = n.radius + 46;
+    if (n.x - padX < minX) minX = n.x - padX;
+    if (n.x + padX > maxX) maxX = n.x + padX;
+    if (n.y - padTop < minY) minY = n.y - padTop;
+    if (n.y + padBot > maxY) maxY = n.y + padBot;
+  });
+  const bw = Math.max(100, maxX - minX);
+  const bh = Math.max(100, maxY - minY);
+  const scale = Math.min((W - 24) / bw, (H - 24) / bh);
+  topoZoom = Math.max(0.45, Math.min(1.45, scale));
+  const midX = (minX + maxX) / 2;
+  const midY = (minY + maxY) / 2;
+  topoPanX = (W / 2 - midX) * topoZoom;
+  topoPanY = (H / 2 - midY) * topoZoom;
+}
+
+function syncTopoFsLayout() {
+  const wrap = document.querySelector('#viewTopology .topo-wrapper');
+  const btn = document.getElementById('btnTopoFs');
+  const isFs = !!(document.fullscreenElement === wrap || (wrap && wrap.classList.contains('topo-fs-fallback')));
+  if (btn) btn.textContent = isFs ? '✕ 退出全屏' : '⛶ 全屏模式';
+  setTimeout(() => {
+    resizeTopoCanvas();
+    nodePositions = {};
+    if (lastStatus) {
+      rebuildTopologyGraph(lastStatus);
+      fitTopologyToView();
+    }
+  }, 80);
+}
+
+function toggleTopoFullscreen() {
+  const wrap = document.querySelector('#viewTopology .topo-wrapper');
+  if (!wrap) return;
+  const isNativeFs = document.fullscreenElement === wrap;
+  const isFallbackFs = wrap.classList.contains('topo-fs-fallback');
+  if (isNativeFs) {
+    if (document.exitFullscreen) document.exitFullscreen().catch(() => {});
+  } else if (isFallbackFs) {
+    wrap.classList.remove('topo-fs-fallback');
+    syncTopoFsLayout();
+  } else {
+    if (wrap.requestFullscreen) {
+      wrap.requestFullscreen().catch(() => {
+        wrap.classList.add('topo-fs-fallback');
+        syncTopoFsLayout();
+      });
+    } else {
+      wrap.classList.add('topo-fs-fallback');
+      syncTopoFsLayout();
+    }
+  }
+}
+
+document.addEventListener('fullscreenchange', syncTopoFsLayout);
+document.addEventListener('keydown', e => {
+  if (e.key === 'Escape') {
+    const wrap = document.querySelector('#viewTopology .topo-wrapper');
+    if (wrap && wrap.classList.contains('topo-fs-fallback')) {
+      wrap.classList.remove('topo-fs-fallback');
+      syncTopoFsLayout();
+    }
+  }
+});
 
 function setTopoLayout(mode) {
   topoLayout = mode;
@@ -3077,7 +3165,10 @@ function setTopoLayout(mode) {
 
 function resetNodePositions() {
   nodePositions = {};
-  if (lastStatus) rebuildTopologyGraph(lastStatus);
+  if (lastStatus) {
+    rebuildTopologyGraph(lastStatus);
+    fitTopologyToView();
+  }
 }
 
 function resetTopoView() {
@@ -3473,9 +3564,13 @@ function rebuildTopologyGraph(d) {
     return true;
   });
 
-  // Sort endpoints by role so similar devices group cleanly
+  // Sort endpoints deterministically by role + numeric IP so nodes never jump around on refresh
   const roleOrder = { rogue: 0, netdev: 1, nas: 2, probe: 3, pc: 4, camera: 5, mobile: 6 };
-  endpointHosts.sort((a, b) => (roleOrder[a.role] ?? 9) - (roleOrder[b.role] ?? 9));
+  endpointHosts.sort((a, b) => {
+    const rd = (roleOrder[a.role] ?? 9) - (roleOrder[b.role] ?? 9);
+    if (rd !== 0) return rd;
+    return ipToNum(a.ip) - ipToNum(b.ip);
+  });
 
   // Find if there is a subordinate router / AP node to visually group or attach to switch
   endpointHosts.forEach(h => {
@@ -3548,7 +3643,8 @@ function rebuildTopologyGraph(d) {
 function layoutHierarchical(nodes, epCount, W, H, hasUpstream) {
   const cx = W / 2;
   const setPos = (nd, x, y) => {
-    if (nodePositions[nd.id] && nodePositions[nd.id].pinned) {
+    // Keep existing node coordinates locked so nodes never jump on live updates
+    if (nodePositions[nd.id]) {
       nd.x = nodePositions[nd.id].x;
       nd.y = nodePositions[nd.id].y;
     } else {
@@ -3604,7 +3700,8 @@ function layoutRadial(nodes, epCount, W, H, hasUpstream) {
   const cx = W / 2;
   const cy = H / 2 + 25;
   const setPos = (nd, x, y) => {
-    if (nodePositions[nd.id] && nodePositions[nd.id].pinned) {
+    // Keep existing node coordinates locked so nodes never jump on live updates
+    if (nodePositions[nd.id]) {
       nd.x = nodePositions[nd.id].x;
       nd.y = nodePositions[nd.id].y;
     } else {
@@ -3738,12 +3835,27 @@ function drawTopologyFrame() {
       const rm = ROLE_META[n.role] || ROLE_META.pc;
       const isSelected = n.id === selectedNodeId;
 
-      // Pulsing halo for Probe, Gateway, or Alert nodes
-      if (n.status === 'crit' || n.role === 'probe' || isSelected) {
-        const pulse = 4 + Math.sin(animTick * 0.08) * 3;
+      // Radiating sonar / soundwave rings for anomalous (crit / warn) nodes
+      if (n.status === 'crit' || n.status === 'warn') {
+        const isCrit = n.status === 'crit';
+        const waveCount = isCrit ? 3 : 2;
+        const maxSpread = isCrit ? 36 : 24;
+        const rgb = isCrit ? '239,68,68' : '245,158,11';
+        for (let w = 0; w < waveCount; w++) {
+          const prog = ((animTick * (isCrit ? 0.016 : 0.012)) + (w / waveCount)) % 1.0;
+          const rWave = n.radius + prog * maxSpread;
+          const alpha = Math.pow(1 - prog, 1.5) * (isCrit ? 0.85 : 0.55);
+          ctx.beginPath();
+          ctx.arc(n.x, n.y, rWave, 0, Math.PI * 2);
+          ctx.strokeStyle = `rgba(${rgb},${alpha.toFixed(3)})`;
+          ctx.lineWidth = (1 - prog) * 2.2 + 0.8;
+          ctx.stroke();
+        }
+      } else if (n.role === 'probe' || isSelected) {
+        const pulse = 4 + Math.sin(animTick * 0.08) * 2.5;
         ctx.beginPath();
         ctx.arc(n.x, n.y, n.radius + pulse, 0, Math.PI * 2);
-        ctx.strokeStyle = n.status === 'crit' ? 'rgba(239,68,68,0.55)' : (isSelected ? 'rgba(56,189,248,0.75)' : 'rgba(56,189,248,0.35)');
+        ctx.strokeStyle = isSelected ? 'rgba(108,108,245,0.8)' : 'rgba(56,189,248,0.35)';
         ctx.lineWidth = 2;
         ctx.stroke();
       }
