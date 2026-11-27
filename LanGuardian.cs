@@ -313,7 +313,7 @@ namespace LanGuardian
 
     public class MonitorEngine
     {
-        public const string AppVersion = "v1.7.0";
+        public const string AppVersion = "v1.7.1";
         public string LogDirectory = "";
         private readonly object _logLock = new object();
         private readonly object _notesLock = new object();
@@ -1195,7 +1195,7 @@ namespace LanGuardian
 
             if (dstInLan && !isIpBcast)
             {
-                dstHost = GetOrAddHost(dstIp, dstMac);
+                dstHost = GetOrAddHost(dstIp, dstMac, false);
                 Interlocked.Increment(ref dstHost.TotalRxPkts);
                 Interlocked.Add(ref dstHost.TotalRxBytes, wireLen);
                 Interlocked.Increment(ref dstHost.WinRxPkts);
@@ -1581,7 +1581,7 @@ namespace LanGuardian
                     {
                         var hh = hKv.Value;
                         double idleSec = (nowDt - hh.LastSeen).TotalSeconds;
-                        // Foreign/cross-subnet rogue nodes vanish from live topology after 180s of silence; normal LAN hosts after 900s
+                        // Foreign/cross-subnet rogue nodes vanish from live topology after 180s of silence; normal LAN hosts after 300s (5 min)
                         if (!hh.IsLocalSubnet && idleSec > 180)
                         {
                             HostStats removedH;
@@ -1591,7 +1591,7 @@ namespace LanGuardian
                                     removedH.Ip, removedH.Mac, removedH.Vendor));
                             }
                         }
-                        else if (hh.IsLocalSubnet && !hh.IsGateway && !LocalHostIps.Contains(hh.Ip) && idleSec > 900)
+                        else if (hh.IsLocalSubnet && !hh.IsGateway && !LocalHostIps.Contains(hh.Ip) && idleSec > 300)
                         {
                             HostStats removedH;
                             Hosts.TryRemove(hKv.Key, out removedH);
@@ -1904,8 +1904,18 @@ namespace LanGuardian
                         );
                     }
 
-                    // 2. Parse system ARP table (`arp -a`) every cycle to catch all L2 neighbors even without Npcap
-                    ReadSystemArpTable();
+                    // 2. Parse system ARP table (`arp -a`) without reviving offline hosts from Windows's stale ARP cache
+                    bool isL2Npcap = NpcapAvailable && !string.IsNullOrEmpty(ActiveAdapter.PcapDeviceName);
+                    if (isL2Npcap)
+                    {
+                        // In Npcap L2 mode, only enrich missing MACs on already-active hosts; real L2 traffic & active sweep determine liveness
+                        if (cycle % 6 == 0) ReadSystemArpTable(true);
+                    }
+                    else
+                    {
+                        // In non-Npcap mode, read at startup only; periodic active SendARP sweep refreshes truly online hosts
+                        if (cycle == 0) ReadSystemArpTable(false);
+                    }
 
                     // 3. In L2 mirror mode, passive capture sees all LAN traffic; only sweep once at startup to avoid self-generated ARP noise
                     if (cycle == 0 || (!ActiveAdapter.IsMirrorCandidate && cycle % 12 == 0))
@@ -1919,7 +1929,7 @@ namespace LanGuardian
             }
         }
 
-        public void ReadSystemArpTable()
+        public void ReadSystemArpTable(bool enrichOnly = false)
         {
             try
             {
@@ -1981,7 +1991,20 @@ namespace LanGuardian
                                 if (ipU == (SubnetNetUint | ~SubnetMaskUint)) continue; // skip subnet broadcast
                                 if (ip.EndsWith(".255") || ip == "25.255.255.254") continue;
                                 if (IsInOtherLocalAdapterSubnet(ip)) continue;
-                                GetOrAddHost(ip, NormalizeMac(mac));
+                                if (enrichOnly)
+                                {
+                                    HostStats existing;
+                                    if (Hosts.TryGetValue(ip, out existing) && string.IsNullOrEmpty(existing.Mac))
+                                    {
+                                        GetOrAddHost(ip, NormalizeMac(mac), false);
+                                    }
+                                }
+                                else
+                                {
+                                    // Never bump LastSeen on already-known hosts from stale OS ARP cache
+                                    bool alreadyExists = Hosts.ContainsKey(ip);
+                                    GetOrAddHost(ip, NormalizeMac(mac), !alreadyExists);
+                                }
                             }
                         }
                     }
@@ -2268,7 +2291,7 @@ namespace LanGuardian
             return ok > 0 ? (double)totalMs / ok : -1;
         }
 
-        public HostStats GetOrAddHost(string ip, string mac)
+        public HostStats GetOrAddHost(string ip, string mac, bool touchLastSeen = true)
         {
             string normMac = NormalizeMac(mac);
             var h = Hosts.GetOrAdd(ip, k => new HostStats
@@ -2280,7 +2303,7 @@ namespace LanGuardian
                 IsGateway = string.Equals(k, ActiveAdapter.Gateway, StringComparison.OrdinalIgnoreCase)
             });
 
-            h.LastSeen = DateTime.Now;
+            if (touchLastSeen) h.LastSeen = DateTime.Now;
             h.IsLocalSubnet = IsInCurrentSubnet(ip);
             bool isGwHost = h.IsGateway || string.Equals(ip, ActiveAdapter.Gateway, StringComparison.OrdinalIgnoreCase);
             if (IsValidUnicastMac(normMac))
