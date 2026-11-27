@@ -268,7 +268,7 @@ namespace LanGuardian
 
     public class MonitorEngine
     {
-        public const string AppVersion = "v1.5.0";
+        public const string AppVersion = "v1.6.0";
         public string LogDirectory = "";
         private readonly object _logLock = new object();
         private readonly ConcurrentDictionary<string, DateTime> _lastAlertLogTime = new ConcurrentDictionary<string, DateTime>();
@@ -2400,6 +2400,227 @@ namespace LanGuardian
             if (n.StartsWith("01:00:5E") || n.StartsWith("33:33:")) return false;
             return n.Length == 17;
         }
+
+        public bool SendPopupMessage(string targetIp, string message, string user, string pass, out string detail, out string hint)
+        {
+            detail = "";
+            hint = "";
+            IPAddress parsed;
+            if (string.IsNullOrWhiteSpace(targetIp) || !IPAddress.TryParse(targetIp.Trim(), out parsed) || parsed.AddressFamily != AddressFamily.InterNetwork)
+            {
+                detail = "无效的目标 IPv4 地址";
+                return false;
+            }
+            string ip = parsed.ToString();
+            string cleanMsg = (message ?? "").Replace("\r", " ").Replace("\n", " ").Replace("\"", "'").Trim();
+            if (string.IsNullOrEmpty(cleanMsg))
+            {
+                detail = "消息内容不能为空";
+                return false;
+            }
+            if (cleanMsg.Length > 220) cleanMsg = cleanMsg.Substring(0, 220);
+
+            if (!RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
+            {
+                detail = "仅 Windows 探针支持 msg.exe 弹窗推送";
+                return false;
+            }
+
+            bool mountedIpc = false;
+            try
+            {
+                if (!string.IsNullOrWhiteSpace(user))
+                {
+                    string safeUser = user.Replace("\"", "").Trim();
+                    string safePass = (pass ?? "").Replace("\"", "");
+                    var netPsi = new ProcessStartInfo
+                    {
+                        FileName = "net.exe",
+                        Arguments = string.Format("use \\\\{0}\\IPC$ \"{1}\" /user:\"{2}\"", ip, safePass, safeUser),
+                        RedirectStandardOutput = true,
+                        RedirectStandardError = true,
+                        UseShellExecute = false,
+                        CreateNoWindow = true
+                    };
+                    using (var np = Process.Start(netPsi))
+                    {
+                        np.WaitForExit(4000);
+                        mountedIpc = (np.ExitCode == 0);
+                    }
+                }
+
+                string msgExe = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.System), "msg.exe");
+                if (!File.Exists(msgExe)) msgExe = "msg.exe";
+
+                var psi = new ProcessStartInfo
+                {
+                    FileName = msgExe,
+                    Arguments = string.Format("* /SERVER:{0} /TIME:60 \"{1}\"", ip, cleanMsg),
+                    RedirectStandardOutput = true,
+                    RedirectStandardError = true,
+                    UseShellExecute = false,
+                    CreateNoWindow = true
+                };
+                using (var p = Process.Start(psi))
+                {
+                    string stdout = p.StandardOutput.ReadToEnd();
+                    string stderr = p.StandardError.ReadToEnd();
+                    if (!p.WaitForExit(6000))
+                    {
+                        try { p.Kill(); } catch { }
+                        detail = "连接目标设备超时 (6秒无响应)";
+                        hint = "目标可能是手机/路由器/已关机，或开启了防火墙拦截 RPC 端口。";
+                        WriteLog("INFO", string.Format("向 {0} 发送弹窗消息失败(超时): {1}", ip, cleanMsg));
+                        return false;
+                    }
+                    string combined = ((stdout ?? "") + " " + (stderr ?? "")).Trim();
+                    if (p.ExitCode == 0)
+                    {
+                        detail = "弹窗消息已成功送达 " + ip + " 的桌面屏幕！";
+                        hint = "对方屏幕上会弹出系统消息窗口（持续 60 秒或点击确定关闭）。";
+                        WriteLog("INFO", string.Format("已向 {0} 发送弹窗消息: {1}", ip, cleanMsg));
+                        return true;
+                    }
+                    detail = string.IsNullOrEmpty(combined) ? ("发送失败 (退出码 " + p.ExitCode + ")") : combined;
+                    if (detail.IndexOf("5", StringComparison.OrdinalIgnoreCase) >= 0 || detail.IndexOf("拒绝", StringComparison.OrdinalIgnoreCase) >= 0 || detail.IndexOf("denied", StringComparison.OrdinalIgnoreCase) >= 0)
+                    {
+                        hint = "目标 Windows 拒绝了远程消息（常见于工作组无权限或未开启 AllowRemoteRPC）。可展开下方填写目标管理员账号密码重试，或改用【深度侦察】识别设备。";
+                    }
+                    else
+                    {
+                        hint = "Windows msg.exe 仅对开启了远程 RPC 的 Windows 专业版/企业版电脑生效；手机、路由器、Mac 或 Windows 家庭版会拒绝连接，建议点击【深度侦察】查主机名与 Web 管理页。";
+                    }
+                    WriteLog("INFO", string.Format("向 {0} 发送弹窗消息未成功 ({1}): {2}", ip, detail, cleanMsg));
+                    return false;
+                }
+            }
+            catch (Exception ex)
+            {
+                detail = "执行 msg.exe 异常: " + ex.Message;
+                hint = "当前探针系统（如部分 Windows 家庭版）可能未内置 msg.exe。";
+                return false;
+            }
+            finally
+            {
+                if (mountedIpc)
+                {
+                    try
+                    {
+                        var delPsi = new ProcessStartInfo("net.exe", "use \\\\" + ip + "\\IPC$ /delete /y")
+                        {
+                            UseShellExecute = false,
+                            CreateNoWindow = true
+                        };
+                        using (var dp = Process.Start(delPsi)) { dp.WaitForExit(2000); }
+                    }
+                    catch { }
+                }
+            }
+        }
+
+        public string ProbeHostDeep(string targetIp)
+        {
+            IPAddress parsed;
+            if (string.IsNullOrWhiteSpace(targetIp) || !IPAddress.TryParse(targetIp.Trim(), out parsed) || parsed.AddressFamily != AddressFamily.InterNetwork)
+            {
+                return "{\"ok\":false,\"error\":\"无效的 IPv4 地址\"}";
+            }
+            string ip = parsed.ToString();
+            string nbName = QueryNetBiosName(ip);
+            string dnsName = "";
+            try
+            {
+                var t = Dns.GetHostEntryAsync(ip);
+                if (t.Wait(800) && t.Result != null && !string.IsNullOrEmpty(t.Result.HostName) && t.Result.HostName != ip)
+                {
+                    dnsName = t.Result.HostName;
+                }
+            }
+            catch { }
+
+            int[] ports = new[] { 80, 443, 8080, 8443, 445, 3389, 22, 554, 9100 };
+            var openPorts = new ConcurrentBag<int>();
+            Parallel.ForEach(ports, port =>
+            {
+                try
+                {
+                    using (var tcp = new TcpClient())
+                    {
+                        var ar = tcp.BeginConnect(ip, port, null, null);
+                        if (ar.AsyncWaitHandle.WaitOne(450) && tcp.Connected)
+                        {
+                            openPorts.Add(port);
+                            tcp.EndConnect(ar);
+                        }
+                    }
+                }
+                catch { }
+            });
+            var sortedPorts = openPorts.OrderBy(x => x).ToList();
+
+            string httpTitle = "";
+            foreach (int hp in new[] { 80, 8080 })
+            {
+                if (!sortedPorts.Contains(hp)) continue;
+                try
+                {
+                    using (var tcp = new TcpClient())
+                    {
+                        tcp.ReceiveTimeout = 900;
+                        tcp.SendTimeout = 900;
+                        tcp.Connect(ip, hp);
+                        using (var ns = tcp.GetStream())
+                        {
+                            byte[] req = Encoding.ASCII.GetBytes("GET / HTTP/1.0\r\nHost: " + ip + "\r\nUser-Agent: LanGuardian\r\nConnection: close\r\n\r\n");
+                            ns.Write(req, 0, req.Length);
+                            byte[] buf = new byte[4096];
+                            int total = 0;
+                            int n;
+                            while (total < buf.Length && (n = ns.Read(buf, total, buf.Length - total)) > 0)
+                            {
+                                total += n;
+                            }
+                            string resp = Encoding.UTF8.GetString(buf, 0, total);
+                            int t1 = resp.IndexOf("<title>", StringComparison.OrdinalIgnoreCase);
+                            int t2 = t1 >= 0 ? resp.IndexOf("</title>", t1 + 7, StringComparison.OrdinalIgnoreCase) : -1;
+                            if (t1 >= 0 && t2 > t1 + 7)
+                            {
+                                httpTitle = resp.Substring(t1 + 7, t2 - t1 - 7).Replace("\r", "").Replace("\n", " ").Trim();
+                                if (httpTitle.Length > 80) httpTitle = httpTitle.Substring(0, 80);
+                                break;
+                            }
+                        }
+                    }
+                }
+                catch { }
+            }
+
+            string guess = "未知类型终端";
+            if (sortedPorts.Contains(3389) || sortedPorts.Contains(445)) guess = "Windows 电脑 / 服务器 (支持 SMB/远程桌面)";
+            else if (sortedPorts.Contains(9100)) guess = "网络打印机";
+            else if (sortedPorts.Contains(554)) guess = "网络摄像头 / NVR 监控录像机";
+            else if (!string.IsNullOrEmpty(httpTitle)) guess = "带 Web 管理界面的网络设备 (" + httpTitle + ")";
+            else if (sortedPorts.Contains(22)) guess = "Linux / 嵌入式设备 / NAS";
+            else if (sortedPorts.Count == 0) guess = "移动终端 / 开启防火墙的主机 (未开放常见端口)";
+
+            HostStats hs;
+            if (Hosts.TryGetValue(ip, out hs))
+            {
+                if (string.IsNullOrEmpty(hs.Hostname))
+                {
+                    if (!string.IsNullOrEmpty(nbName)) hs.Hostname = nbName;
+                    else if (!string.IsNullOrEmpty(dnsName)) hs.Hostname = dnsName.Split('.')[0];
+                    else if (!string.IsNullOrEmpty(httpTitle)) hs.Hostname = httpTitle;
+                }
+                if (sortedPorts.Count > 0) hs.AddActivity("开放端口: " + string.Join(",", sortedPorts));
+                if (!string.IsNullOrEmpty(httpTitle)) hs.AddActivity("Web标题: " + httpTitle);
+            }
+
+            Func<string, string> esc = s => string.IsNullOrEmpty(s) ? "" : s.Replace("\\", "\\\\").Replace("\"", "\\\"").Replace("\r", " ").Replace("\n", " ");
+            return string.Format(
+                "{{\"ok\":true,\"ip\":\"{0}\",\"netbios\":\"{1}\",\"dns\":\"{2}\",\"httpTitle\":\"{3}\",\"ports\":[{4}],\"guess\":\"{5}\"}}",
+                esc(ip), esc(nbName), esc(dnsName), esc(httpTitle), string.Join(",", sortedPorts), esc(guess));
+        }
     }
 
     public class WebDashboardServer
@@ -2534,6 +2755,24 @@ namespace LanGuardian
                         {
                             _engine.ResetAllStats();
                             SendJson(stream, "{\"ok\":true}");
+                        }
+                        else if (path == "/api/send-msg")
+                        {
+                            var q = ParseQuery(query);
+                            string ip = q.ContainsKey("ip") ? q["ip"] : "";
+                            string msg = q.ContainsKey("msg") ? q["msg"] : "";
+                            string user = q.ContainsKey("user") ? q["user"] : "";
+                            string pass = q.ContainsKey("pass") ? q["pass"] : "";
+                            string detail, hint;
+                            bool ok = _engine.SendPopupMessage(ip, msg, user, pass, out detail, out hint);
+                            SendJson(stream, string.Format("{{\"ok\":{0},\"detail\":\"{1}\",\"hint\":\"{2}\"}}",
+                                ok ? "true" : "false", Esc(detail), Esc(hint)));
+                        }
+                        else if (path == "/api/probe-host")
+                        {
+                            var q = ParseQuery(query);
+                            string ip = q.ContainsKey("ip") ? q["ip"] : "";
+                            SendJson(stream, _engine.ProbeHostDeep(ip));
                         }
                         else if (path == "/download/LanGuardian.exe")
                         {
@@ -2768,11 +3007,21 @@ namespace LanGuardian
 }
 * { box-sizing: border-box; margin: 0; padding: 0; }
 body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Microsoft YaHei', sans-serif; background: var(--bg); color: var(--text); padding: 16px 22px; line-height: 1.5; }
-.header { display: flex; flex-wrap: wrap; justify-content: space-between; align-items: center; gap: 12px; padding-bottom: 14px; border-bottom: 1px solid var(--border); margin-bottom: 14px; }
-.title-box h1 { font-size: 20px; font-weight: 700; color: #fff; display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.header { display: flex; flex-wrap: wrap; justify-content: space-between; align-items: center; gap: 10px; padding-bottom: 12px; border-bottom: 1px solid var(--border); margin-bottom: 12px; }
+.title-box h1 { font-size: 19px; font-weight: 700; color: #fff; display: flex; align-items: center; gap: 9px; flex-wrap: wrap; }
 .badge-version { font-size: 12px; background: #6c6cf5; color: #fff; padding: 2px 9px; border-radius: 999px; font-weight: 600; letter-spacing: 0.3px; }
-.badge-engine { font-size: 12px; background: rgba(108,108,245,0.16); color: #a5a5ff; border: 1px solid rgba(108,108,245,0.4); padding: 3px 10px; border-radius: 999px; font-weight: 500; }
-.controls { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+.badge-engine { font-size: 11.5px; background: rgba(108,108,245,0.16); color: #a5a5ff; border: 1px solid rgba(108,108,245,0.4); padding: 2px 9px; border-radius: 999px; font-weight: 500; }
+.controls { display: flex; flex-wrap: wrap; align-items: center; gap: 7px; }
+.nic-pill { display: inline-flex; align-items: center; gap: 7px; background: rgba(108,108,245,0.14); border: 1px solid rgba(108,108,245,0.45); color: #e0e7ff; padding: 6px 12px; border-radius: 8px; font-size: 12.5px; cursor: pointer; transition: 0.15s; }
+.nic-pill:hover { background: rgba(108,108,245,0.25); }
+.nic-pill.alert { border-color: var(--crit); background: rgba(239,68,68,0.18); color: #fecaca; }
+.nic-drawer { background: var(--card); border: 1px solid rgba(108,108,245,0.45); border-radius: 10px; padding: 14px 16px; margin-bottom: 14px; display: flex; flex-direction: column; gap: 12px; }
+.nic-cards { display: flex; gap: 10px; flex-wrap: wrap; }
+.nic-card { cursor: pointer; padding: 10px 13px; border-radius: 8px; border: 1px solid var(--border); background: #14161a; min-width: 240px; flex: 1; transition: 0.15s; }
+.nic-card:hover { border-color: #6c6cf5; }
+.nic-card.active { border-color: #6c6cf5; background: rgba(108,108,245,0.16); }
+.quick-msg-btn { padding: 4px 8px; font-size: 11.5px; background: #20242c; border: 1px solid var(--border); color: #cbd5e1; border-radius: 5px; cursor: pointer; }
+.quick-msg-btn:hover { border-color: #6c6cf5; color: #fff; background: rgba(108,108,245,0.2); }
 select, input, button { background: #20242c; color: var(--text); border: 1px solid var(--border); padding: 6px 12px; border-radius: 6px; font-size: 13px; }
 button { cursor: pointer; background: #6c6cf5; border-color: #5b5be0; color: #fff; font-weight: 500; transition: 0.15s; }
 button:hover { background: #5a5ae2; }
@@ -2955,19 +3204,40 @@ tr:hover { background: rgba(56,189,248,0.08); }
 <body>
 <div class='header'>
   <div class='title-box'>
-    <h1>LanGuardian 局域网实时检测与故障诊断中心 <span id='versionBadge' class='badge-version'>v1.5.0</span> <span id='engineBadge' class='badge-engine'>加载中...</span></h1>
-    <div style='font-size:12.5px;color:var(--muted);margin-top:4px;'>
-      当前监控网卡: <b id='curAdapter' style='color:#fff'>-</b> | 自动识别网段: <b id='curCidr' style='color:#a5a5ff'>-</b> | 网关: <b id='curGw'>-</b>
-    </div>
+    <h1>LanGuardian 局域网实时检测与故障诊断中心 <span id='versionBadge' class='badge-version'>v1.6.0</span> <span id='engineBadge' class='badge-engine'>加载中...</span></h1>
   </div>
   <div class='controls'>
-    <select id='adapterSel' title='切换监控网卡（支持选择第二块端口镜像专用网卡）'></select>
-    <input id='cidrInput' type='text' placeholder='网段 CIDR (如 10.0.0.0/24)' style='width:140px;'>
-    <button onclick='applyAdapter()'>切换网卡/网段</button>
-    <button id='btnPauseToggle' class='secondary' onclick='togglePause()' style='border-color:#f59e0b;color:#fcd34d;'>⏸️ 暂停监控</button>
-    <button class='secondary' onclick='resetAllStats()' title='清空旧环境缓存数据并重新识别当前局域网'>🔄 重置数据</button>
-    <button class='secondary' onclick='triggerScan()'>立即扫描</button>
-    <button class='secondary' onclick='exportReport()'>导出报告</button>
+    <button id='nicSummaryBtn' class='nic-pill' onclick='toggleNicDrawer()' title='点击展开/收起统一网卡切换、网段与双网卡串线检测设置'>
+      <span class='dot ok' id='nicPillDot'></span>
+      <span id='nicPillText'>📡 网卡与网段</span>
+      <span id='nicPillArrow'>▾</span>
+    </button>
+    <button id='btnPauseToggle' class='secondary' onclick='togglePause()' style='border-color:#f59e0b;color:#fcd34d;'>⏸️ 暂停</button>
+    <button class='secondary' onclick='triggerScan()' title='主动探测当前网段在线设备'>🔎 扫描</button>
+    <button class='secondary' onclick='resetAllStats()' title='清空界面实时缓存（不影响按天日志文件）'>🔄 重置</button>
+    <button class='secondary' onclick='exportReport()' title='导出当前 JSON 诊断快照'>📥 导出</button>
+  </div>
+</div>
+
+<!-- 统一网卡与抓包设置抽屉（合并原顶部字幕、网卡下拉、双网卡栏为唯一入口） -->
+<div id='nicDrawer' class='nic-drawer hidden'>
+  <div style='display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:10px;'>
+    <div style='display:flex;align-items:center;gap:10px;flex-wrap:wrap;'>
+      <b style='font-size:14px;color:#fff;'>⚙️ 网卡切换与抓包控制中心</b>
+      <span id='nicDrawerStatus'></span>
+      <span id='nicDrawerVirtual' style='font-size:12px;color:var(--muted);'></span>
+    </div>
+    <div style='display:flex;align-items:center;gap:8px;flex-wrap:wrap;'>
+      <span style='font-size:12px;color:var(--muted);'>网段 CIDR:</span>
+      <input id='cidrInput' type='text' placeholder='如 10.0.0.0/24' style='width:130px;padding:4px 8px;font-size:12.5px;'>
+      <button style='padding:4px 10px;font-size:12px;' onclick='applyCidrOnly()'>应用网段</button>
+      <button id='btnCrossWireToggle' class='secondary hidden' style='padding:4px 10px;font-size:12px;' onclick='toggleCrossWire()'>🔓 串线检测: 自动</button>
+      <button class='secondary' style='padding:4px 9px;font-size:12px;' onclick='toggleNicDrawer()'>收起 ▴</button>
+    </div>
+  </div>
+  <div id='nicCardsBox' class='nic-cards'></div>
+  <div style='font-size:12px;color:var(--muted);'>
+    💡 点击上方任意物理网卡卡片即可立即切换抓包口（自动记住选择）；当前网关: <b id='curGw' style='color:#e8eaed;'>-</b> | 自动识别网段: <b id='curCidr' style='color:#a5a5ff;'>-</b>
   </div>
 </div>
 
@@ -3009,7 +3279,6 @@ tr:hover { background: rgba(56,189,248,0.08); }
 
 <!-- ==================== TAB 1: 综合监控视图 ==================== -->
 <div id='viewOverview' class='tab-pane-anim'>
-  <div id='dualNicBar' class='card hidden' style='margin-bottom:14px;border-color:rgba(108,108,245,0.45);background:linear-gradient(90deg,rgba(108,108,245,0.12),#1c1f26 45%);'></div>
   <div class='grid-4'>
     <div class='card'>
       <div class='card-label'>局域网健康评分</div>
@@ -3085,23 +3354,30 @@ tr:hover { background: rgba(56,189,248,0.08); }
     <div class='topo-stage'>
       <div class='topo-toolbar'>
         <div style='display:flex;align-items:center;gap:6px;flex-wrap:wrap;'>
-          <span style='font-size:12.5px;color:var(--muted);margin-right:4px;'>布局模式:</span>
-          <button id='btnLayoutTree' class='secondary active' onclick='setTopoLayout(""tree"")'>🏛️ 分层架构拓扑图</button>
-          <button id='btnLayoutRadial' class='secondary' onclick='setTopoLayout(""radial"")'>🎯 星型通信态势图</button>
-          <span style='font-size:12.5px;color:var(--muted);margin-left:10px;'>筛选:</span>
-          <select id='topoFilter' onchange='resetNodePositions()'>
-            <option value='all'>全部节点</option>
-            <option value='active'>仅看当前有流量节点</option>
-            <option value='anomaly'>仅看异常 / 高重传节点</option>
-            <option value='pc_nas'>电脑 / 服务器 / NAS</option>
-            <option value='net_iot'>网络设备 / 监控 / IoT</option>
+          <button id='btnLayoutTree' class='secondary active' onclick='setTopoLayout(""tree"")' title='经典分层架构拓扑'>🏛️ 分层</button>
+          <button id='btnLayoutGroup' class='secondary' onclick='setTopoLayout(""group"")' title='大网段推荐：按疑点/类型/品牌/IP段分组且支持折叠'>📦 智能分组</button>
+          <button id='btnLayoutRadial' class='secondary' onclick='setTopoLayout(""radial"")' title='星型放射态势'>🎯 星型</button>
+          <select id='topoGroupBy' class='hidden' onchange='onTopoGroupByChange()' title='选择分组维度' style='border-color:#6c6cf5;'>
+            <option value='status'>🚨 按疑点与健康分组</option>
+            <option value='subnet'>🌐 按网段 / IP段分组</option>
+            <option value='vendor'>🏭 按品牌 / 厂商分组</option>
+            <option value='role'>🏷️ 按设备类型分组</option>
           </select>
+          <select id='topoFilter' onchange='autoArrangeTopology()' title='快速筛选节点'>
+            <option value='all'>全部节点</option>
+            <option value='active'>仅看有流量</option>
+            <option value='anomaly'>仅看异常/疑点</option>
+            <option value='pc_nas'>电脑 / NAS</option>
+            <option value='net_iot'>网络 / 监控 / 异网段</option>
+          </select>
+          <input id='topoSearch' type='text' placeholder='🔍 搜索 IP/网段/品牌/主机名...' style='width:175px;padding:5px 9px;font-size:12.5px;' oninput='onTopoSearchInput()' onkeydown='onTopoSearchKey(event)'>
         </div>
-        <div style='display:flex;align-items:center;gap:6px;'>
+        <div style='display:flex;align-items:center;gap:5px;flex-wrap:wrap;'>
+          <button class='secondary' onclick='autoArrangeTopology()' title='立即消除重叠并整齐排列所有节点'>🧹 自动整理</button>
+          <button id='btnAutoArrange' class='secondary active' onclick='toggleAutoArrange()' title='新设备加入或出现重叠时自动整理防重叠'>🔄 自动避让: 开</button>
           <button class='secondary' onclick='zoomTopo(1.18)' title='放大'>＋</button>
           <button class='secondary' onclick='zoomTopo(0.85)' title='缩小'>－</button>
-          <button class='secondary' onclick='resetTopoView()'>重置视图与布局</button>
-          <button id='btnTopoFs' class='secondary' onclick='toggleTopoFullscreen()' title='进入/退出全屏视图' style='border-color:#6c6cf5;color:#c7c7ff;'>⛶ 全屏模式</button>
+          <button id='btnTopoFs' class='secondary' onclick='toggleTopoFullscreen()' title='进入/退出全屏视图' style='border-color:#6c6cf5;color:#c7c7ff;'>⛶ 全屏</button>
         </div>
       </div>
 
@@ -3179,10 +3455,17 @@ tr:hover { background: rgba(56,189,248,0.08); }
 
 <script>
 let lastStatus = null;
-let adapterInitialized = false;
+let cidrInitialized = false;
 let currentTab = 'overview';
-let topoLayout = 'tree'; // 'tree' | 'radial'
+let topoLayout = 'tree'; // 'tree' | 'group' | 'radial'
+let topoGroupBy = 'status'; // 'status' | 'subnet' | 'vendor' | 'role'
+let autoArrangeEnabled = true;
+let topoSearchQuery = '';
+let lastTopoNodeSig = '';
+let collapsedGroups = {};
+let topoGroupBoxes = [];
 let selectedNodeId = null;
+let nicDrawerOpen = false;
 
 // Table Sorting State
 let sortCol = '';
@@ -3346,10 +3629,16 @@ function fitTopologyToView() {
     if (n.y - padTop < minY) minY = n.y - padTop;
     if (n.y + padBot > maxY) maxY = n.y + padBot;
   });
+  (topoGroupBoxes || []).forEach(g => {
+    if (g.x - 16 < minX) minX = g.x - 16;
+    if (g.x + g.w + 16 > maxX) maxX = g.x + g.w + 16;
+    if (g.y - 16 < minY) minY = g.y - 16;
+    if (g.y + g.h + 16 > maxY) maxY = g.y + g.h + 16;
+  });
   const bw = Math.max(100, maxX - minX);
   const bh = Math.max(100, maxY - minY);
   const scale = Math.min((W - 24) / bw, (H - 24) / bh);
-  topoZoom = Math.max(0.45, Math.min(1.45, scale));
+  topoZoom = Math.max(0.35, Math.min(1.45, scale));
   const midX = (minX + maxX) / 2;
   const midY = (minY + maxY) / 2;
   topoPanX = (W / 2 - midX) * topoZoom;
@@ -3408,27 +3697,86 @@ document.addEventListener('keydown', e => {
 function setTopoLayout(mode) {
   topoLayout = mode;
   document.getElementById('btnLayoutTree').classList.toggle('active', mode === 'tree');
+  document.getElementById('btnLayoutGroup').classList.toggle('active', mode === 'group');
   document.getElementById('btnLayoutRadial').classList.toggle('active', mode === 'radial');
-  resetNodePositions();
+  const gb = document.getElementById('topoGroupBy');
+  if (gb) gb.classList.toggle('hidden', mode !== 'group');
+  autoArrangeTopology();
 }
 
-function resetNodePositions() {
+function onTopoGroupByChange() {
+  const gb = document.getElementById('topoGroupBy');
+  topoGroupBy = gb ? gb.value : 'status';
+  collapsedGroups = {};
+  autoArrangeTopology();
+}
+
+function toggleAutoArrange() {
+  autoArrangeEnabled = !autoArrangeEnabled;
+  const btn = document.getElementById('btnAutoArrange');
+  if (btn) {
+    btn.classList.toggle('active', autoArrangeEnabled);
+    btn.textContent = autoArrangeEnabled ? '🔄 自动避让: 开' : '🔄 自动避让: 关';
+  }
+  if (autoArrangeEnabled) autoArrangeTopology();
+}
+
+function autoArrangeTopology() {
   nodePositions = {};
+  lastTopoNodeSig = '';
   if (lastStatus) {
     rebuildTopologyGraph(lastStatus);
     fitTopologyToView();
   }
 }
 
+function onTopoSearchInput() {
+  const el = document.getElementById('topoSearch');
+  topoSearchQuery = el ? el.value.trim().toLowerCase() : '';
+}
+
+function onTopoSearchKey(e) {
+  if (e.key === 'Enter' && topoSearchQuery) {
+    const match = topoGraphNodes.find(n => nodeMatchesSearch(n, topoSearchQuery));
+    if (match) {
+      selectedNodeId = match.id;
+      renderInspector(match.id);
+      topoZoom = Math.max(topoZoom, 1.15);
+      topoPanX = (topoLogicW / 2 - match.x) * topoZoom;
+      topoPanY = (topoLogicH / 2 - match.y) * topoZoom;
+    }
+  }
+}
+
+function nodeMatchesSearch(n, q) {
+  if (!q) return true;
+  const r = n.raw || {};
+  const hay = [n.id, n.label, n.sub, r.ip, r.hostname, r.mac, r.vendor, r.role, r.activities]
+    .filter(Boolean).join(' ').toLowerCase();
+  return hay.includes(q);
+}
+
+function resetNodePositions() {
+  autoArrangeTopology();
+}
+
 function resetTopoView() {
   topoZoom = 1.0;
   topoPanX = 0;
   topoPanY = 0;
-  resetNodePositions();
+  autoArrangeTopology();
 }
 
 function zoomTopo(factor) {
-  topoZoom = Math.min(2.4, Math.max(0.45, topoZoom * factor));
+  topoZoom = Math.min(2.4, Math.max(0.35, topoZoom * factor));
+}
+
+function toggleNicDrawer() {
+  nicDrawerOpen = !nicDrawerOpen;
+  const dr = document.getElementById('nicDrawer');
+  const arr = document.getElementById('nicPillArrow');
+  if (dr) dr.classList.toggle('hidden', !nicDrawerOpen);
+  if (arr) arr.textContent = nicDrawerOpen ? '▴' : '▾';
 }
 
 async function toggleCrossWire() {
@@ -3438,52 +3786,87 @@ async function toggleCrossWire() {
 
 async function quickSwitchNic(id) {
   await fetch('/api/switch?id=' + encodeURIComponent(id));
+  cidrInitialized = false;
+  autoArrangeTopology();
   fetchStatus();
 }
 
-function renderDualNic(d) {
-  const bar = document.getElementById('dualNicBar');
-  if (!bar) return;
-  const dn = d.dualNic;
-  if (!dn || !dn.nics || dn.nics.length < 2) {
-    bar.classList.add('hidden');
-    return;
+async function applyCidrOnly() {
+  const cidr = document.getElementById('cidrInput').value.trim();
+  if (!lastStatus || !lastStatus.activeAdapter) return;
+  await fetch('/api/switch?id=' + encodeURIComponent(lastStatus.activeAdapter.id) + '&cidr=' + encodeURIComponent(cidr));
+  autoArrangeTopology();
+  fetchStatus();
+}
+
+function renderNicPanel(d) {
+  const dn = d.dualNic || {};
+  const nics = dn.nics || [];
+  const hasDual = nics.length >= 2;
+  const leak = hasDual && (!dn.sameSegment || dn.isolateCheck) && (dn.syncHits >= 3 || dn.sharedCount >= 1);
+
+  // 1. Update single unified header pill
+  const pillBtn = document.getElementById('nicSummaryBtn');
+  const pillDot = document.getElementById('nicPillDot');
+  const pillTxt = document.getElementById('nicPillText');
+  if (pillBtn && pillDot && pillTxt) {
+    pillBtn.classList.toggle('alert', leak);
+    pillDot.className = 'dot ' + (leak ? 'crit' : 'ok');
+    let shortNic = (d.activeAdapter.name || '未选网卡');
+    if (shortNic.length > 18) shortNic = shortNic.slice(0, 18) + '…';
+    pillTxt.textContent = (leak ? '🚨 双网串线 · ' : '📡 ') + shortNic + ' · ' + (d.activeCidr || '-');
   }
-  bar.classList.remove('hidden');
-  const leak = (!dn.sameSegment || dn.isolateCheck) && (dn.syncHits >= 3 || dn.sharedCount >= 1);
-  let statusBadge = '';
-  if (leak) {
-    statusBadge = `<span class='tag critical'>🚨 检测到双网段串线 (同帧碰撞 ${dn.syncHits} / 跨接MAC ${dn.sharedCount})</span>`;
-  } else if (dn.sameSegment && !dn.isolateCheck) {
-    statusBadge = `<span class='tag ok'>🔗 同网段双线模式 (主口+镜像口)</span>`;
-  } else {
-    statusBadge = `<span class='tag ok'>🛡️ 双物理网段完全隔离 (无串线)</span>`;
+
+  // 2. Update unified drawer content
+  const stEl = document.getElementById('nicDrawerStatus');
+  if (stEl) {
+    if (leak) stEl.innerHTML = `<span class='tag critical'>🚨 检测到双网段串线 (碰撞 ${dn.syncHits} / 跨接MAC ${dn.sharedCount})</span>`;
+    else if (hasDual && dn.sameSegment && !dn.isolateCheck) stEl.innerHTML = `<span class='tag ok'>🔗 同网段双线模式 (主口+镜像口)</span>`;
+    else if (hasDual) stEl.innerHTML = `<span class='tag ok'>🛡️ 双物理网段完全隔离</span>`;
+    else stEl.innerHTML = `<span class='tag ok'>单物理网卡模式</span>`;
   }
-  const vtInfo = dn.ignoredVirtual > 0 ? `<span style='font-size:11.5px;color:#9aa0a6;'>已自动隔离 ${dn.ignoredVirtual} 个虚拟网卡(ZeroTier/VPN)</span>` : '';
-  const cards = dn.nics.map(n => `
-    <div onclick='quickSwitchNic(""${n.id}"")' style='cursor:pointer;padding:8px 12px;border-radius:8px;border:1px solid ${n.active ? ""#6c6cf5"" : ""#2a2f3a""};background:${n.active ? ""rgba(108,108,245,0.18)"" : ""#14161a""};min-width:250px;flex:1;'>
-      <div style='display:flex;justify-content:space-between;align-items:center;gap:8px;font-size:12.5px;'>
-        <b style='color:#fff;'>${n.active ? '▶ ' : ''}${n.name}</b>
-        <span style='font-size:11px;color:#a5a5ff;'>${n.subnet || '侦听中'}</span>
+  const vtEl = document.getElementById('nicDrawerVirtual');
+  if (vtEl) {
+    vtEl.textContent = dn.ignoredVirtual > 0 ? `已自动屏蔽 ${dn.ignoredVirtual} 个虚拟网卡(ZeroTier/VPN)` : '';
+  }
+  const cwBtn = document.getElementById('btnCrossWireToggle');
+  if (cwBtn) {
+    cwBtn.classList.toggle('hidden', !hasDual);
+    cwBtn.textContent = dn.isolateCheck ? '🔒 串线检测: 强制开启' : '🔓 串线检测: 自动识别';
+    cwBtn.style.borderColor = dn.isolateCheck ? '#6c6cf5' : '';
+    cwBtn.style.color = dn.isolateCheck ? '#a5a5ff' : '';
+  }
+
+  const cardsBox = document.getElementById('nicCardsBox');
+  if (cardsBox) {
+    const srcList = (d.adapters || []).map(a => {
+      const live = nics.find(x => x.id === a.id) || {};
+      return {
+        id: a.id,
+        name: a.name,
+        desc: a.desc,
+        ip: a.ip,
+        subnet: live.subnet || a.cidr || '侦听中',
+        kbps: live.kbps || 0,
+        pps: live.pps || 0,
+        macs: live.macs || 0,
+        isUp: a.isUp,
+        isMirror: a.isMirror,
+        active: a.id === d.activeAdapter.id
+      };
+    });
+    cardsBox.innerHTML = srcList.map(n => `
+      <div class='nic-card ${n.active ? ""active"" : """"}' onclick='quickSwitchNic(""${n.id}"")'>
+        <div style='display:flex;justify-content:space-between;align-items:center;gap:8px;font-size:12.5px;'>
+          <b style='color:#fff;'>${n.active ? '▶ [当前] ' : ''}${n.isMirror ? '🪞 ' : '🌐 '}${n.name}${n.isUp ? '' : ' (未插线)'}</b>
+          <span style='font-size:11px;color:#a5a5ff;'>${n.subnet}</span>
+        </div>
+        <div style='font-size:11.5px;color:#9aa0a6;margin-top:4px;'>
+          速率: <b style='color:#e8eaed;'>${n.kbps} KB/s</b> (${n.pps} pps) | MAC: <b style='color:#e8eaed;'>${n.macs}</b> | ${n.ip ? n.ip : '纯二层无IP'}
+        </div>
       </div>
-      <div style='font-size:12px;color:#9aa0a6;margin-top:4px;'>
-        速率: <b style='color:#e8eaed;'>${n.kbps} KB/s</b> (${n.pps} pps) | 发现MAC: <b style='color:#e8eaed;'>${n.macs}</b> | ${n.ip ? n.ip : '纯二层无IP'}
-      </div>
-    </div>
-  `).join('');
-  bar.innerHTML = `
-    <div style='display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px;margin-bottom:10px;'>
-      <div style='display:flex;align-items:center;gap:10px;flex-wrap:wrap;'>
-        <b style='font-size:13.5px;color:#fff;'>🔀 双物理网段并发监控 & 串线检测</b>
-        ${statusBadge}
-        ${vtInfo}
-      </div>
-      <button class='secondary' style='padding:4px 10px;font-size:12px;${dn.isolateCheck ? ""border-color:#6c6cf5;color:#a5a5ff;"" : """"}' onclick='toggleCrossWire()'>
-        ${dn.isolateCheck ? '🔒 物理隔离串线检测: 强制开启' : '🔓 物理隔离串线检测: 自动识别'}
-      </button>
-    </div>
-    <div style='display:flex;gap:10px;flex-wrap:wrap;'>${cards}</div>
-  `;
+    `).join('');
+  }
 }
 
 async function fetchStatus() {
@@ -3498,7 +3881,7 @@ async function fetchStatus() {
 function renderStatus(d) {
   const verEl = document.getElementById('versionBadge');
   if (verEl && d.version) verEl.textContent = d.version;
-  renderDualNic(d);
+  renderNicPanel(d);
   const badgeEl = document.getElementById('engineBadge');
   badgeEl.textContent = d.captureEngine;
   badgeEl.style.background = d.paused ? 'rgba(245,158,11,0.2)' : 'rgba(108,108,245,0.16)';
@@ -3507,41 +3890,32 @@ function renderStatus(d) {
   const pauseBtn = document.getElementById('btnPauseToggle');
   if (pauseBtn) {
     if (d.paused) {
-      pauseBtn.innerHTML = '▶️ 恢复监控';
+      pauseBtn.innerHTML = '▶️ 恢复';
       pauseBtn.style.background = '#059669';
       pauseBtn.style.borderColor = '#10b981';
       pauseBtn.style.color = '#fff';
     } else {
-      pauseBtn.innerHTML = '⏸️ 暂停监控';
-      pauseBtn.style.background = '#1e293b';
+      pauseBtn.innerHTML = '⏸️ 暂停';
+      pauseBtn.style.background = '#20242c';
       pauseBtn.style.borderColor = '#f59e0b';
       pauseBtn.style.color = '#fcd34d';
     }
   }
 
-  document.getElementById('curAdapter').textContent = (d.activeAdapter.name || '') + ' (' + (d.activeAdapter.ip || '无IP镜像口') + ')';
-  document.getElementById('curCidr').textContent = d.activeCidr;
-  document.getElementById('curGw').textContent = d.activeAdapter.gw || '未检测到';
+  const curCidrEl = document.getElementById('curCidr');
+  if (curCidrEl) curCidrEl.textContent = d.activeCidr;
+  const curGwEl = document.getElementById('curGw');
+  if (curGwEl) curGwEl.textContent = d.activeAdapter.gw || '未检测到';
 
   document.getElementById('topoNodeBadge').textContent = d.hosts.length + ' 节点';
   const alertBadge = document.getElementById('alertTabBadge');
   alertBadge.textContent = d.alerts.length;
   alertBadge.classList.toggle('crit', d.alerts.length > 0);
 
-  if (!adapterInitialized && d.adapters && d.adapters.length > 0) {
-    const sel = document.getElementById('adapterSel');
-    sel.innerHTML = '';
-    d.adapters.forEach(a => {
-      const opt = document.createElement('option');
-      opt.value = a.id;
-      const tag = a.isMirror ? '【镜像/副网卡】' : (a.gw ? '【主上网口】' : '');
-      const state = a.isUp ? '' : ' (未插线)';
-      opt.textContent = tag + a.name + state + ' [' + (a.ip || '纯抓包无IP') + '] - ' + a.desc;
-      if (a.id === d.activeAdapter.id) opt.selected = true;
-      sel.appendChild(opt);
-    });
-    document.getElementById('cidrInput').value = d.activeCidr;
-    adapterInitialized = true;
+  if (!cidrInitialized && d.activeCidr) {
+    const ci = document.getElementById('cidrInput');
+    if (ci) ci.value = d.activeCidr;
+    cidrInitialized = true;
   }
 
   renderChainBar(d);
@@ -3707,7 +4081,6 @@ function renderChainBar(d) {
     `;
   }
 
-  html += `<button class='secondary' style='margin-left:auto;padding:4px 10px;font-size:12px;' onclick='switchTab(""topology"")'>打开全屏交互拓扑图 🕸️</button>`;
   document.getElementById('chainBar').innerHTML = html;
 }
 
@@ -3873,15 +4246,36 @@ function rebuildTopologyGraph(d) {
     }
   });
 
-  // 7. Compute Node Coordinates (preserving any user-dragged positions)
-  if (topoLayout === 'tree') {
+  // 7. Auto-arrange check: if auto-arrange is ON and device set changed (e.g. new morning device joined), re-pack non-pinned nodes cleanly
+  const nodeSig = topoLayout + '|' + topoGroupBy + '|' + endpointHosts.map(h => h.ip).join(',');
+  const membershipChanged = (lastTopoNodeSig !== '' && nodeSig !== lastTopoNodeSig);
+  lastTopoNodeSig = nodeSig;
+  if (autoArrangeEnabled && membershipChanged) {
+    Object.keys(nodePositions).forEach(k => {
+      if (!nodePositions[k].pinned) delete nodePositions[k];
+    });
+  }
+
+  topoGroupBoxes = [];
+  if (topoLayout === 'group') {
+    layoutGrouped(nodes, edges, W, H, upNode != null);
+  } else if (topoLayout === 'tree') {
     layoutHierarchical(nodes, endpointHosts.length, W, H, upNode != null);
   } else {
     layoutRadial(nodes, endpointHosts.length, W, H, upNode != null);
   }
 
+  // Final overlap safety check when auto-arrange is enabled
+  if (autoArrangeEnabled && topoLayout !== 'group') {
+    resolveAnyNodeOverlap(nodes, 78);
+  }
+
   topoGraphNodes = nodes;
   topoGraphEdges = edges;
+
+  if (autoArrangeEnabled && membershipChanged && currentTab === 'topology') {
+    fitTopologyToView();
+  }
 
   if (!selectedNodeId && d.activeAdapter.ip) {
     selectedNodeId = d.activeAdapter.ip;
@@ -3889,18 +4283,212 @@ function rebuildTopologyGraph(d) {
   }
 }
 
+function findNonOverlappingPos(x, y, placed, minDist) {
+  const isFree = (cx, cy) => {
+    for (let i = 0; i < placed.length; i++) {
+      const dx = cx - placed[i].x, dy = cy - placed[i].y;
+      if (dx * dx + dy * dy < minDist * minDist) return false;
+    }
+    return true;
+  };
+  if (isFree(x, y)) return { x, y };
+  for (let ring = 1; ring <= 14; ring++) {
+    const step = minDist * 0.95;
+    for (let a = 0; a < 12; a++) {
+      const ang = (a / 12) * Math.PI * 2;
+      const nx = x + Math.cos(ang) * step * ring;
+      const ny = y + Math.sin(ang) * step * ring;
+      if (isFree(nx, ny)) return { x: nx, y: ny };
+    }
+  }
+  return { x: x + minDist, y: y + minDist };
+}
+
+function resolveAnyNodeOverlap(nodes, minDist) {
+  const eps = nodes.filter(n => !['WAN_INTERNET', 'UPSTREAM_GW', 'LAN_SWITCH_CORE'].includes(n.id) && n.role !== 'gateway');
+  for (let i = 0; i < eps.length; i++) {
+    for (let j = i + 1; j < eps.length; j++) {
+      const a = eps[i], b = eps[j];
+      const dx = b.x - a.x, dy = b.y - a.y;
+      const dist = Math.sqrt(dx * dx + dy * dy);
+      if (dist < minDist) {
+        if (nodePositions[b.id] && nodePositions[b.id].pinned) continue;
+        const placed = nodes.filter(n => n.id !== b.id && typeof n.x === 'number');
+        const p = findNonOverlappingPos(b.x, b.y, placed, minDist + 10);
+        b.x = p.x; b.y = p.y;
+        nodePositions[b.id] = { x: p.x, y: p.y, pinned: false };
+      }
+    }
+  }
+}
+
+function classifyEndpointGroup(nd, mode) {
+  const h = nd.raw || {};
+  if (mode === 'status') {
+    if (nd.status === 'crit' || nd.status === 'warn') return { key: 'st_anom', title: '🚨 异常与疑点设备', order: 0, crit: true };
+    if (nd.role === 'netdev' || nd.role === 'nas' || nd.role === 'probe') return { key: 'st_infra', title: '📶 网络设施与存储', order: 1, crit: false };
+    if (nd.role === 'pc') return { key: 'st_pc', title: '💻 办公电脑与工作站', order: 2, crit: false };
+    if (nd.role === 'mobile') return { key: 'st_mob', title: '📱 移动终端', order: 3, crit: false };
+    return { key: 'st_iot', title: '📷 监控与智能 IoT', order: 4, crit: false };
+  }
+  if (mode === 'role') {
+    const rm = ROLE_META[nd.role] || ROLE_META.pc;
+    const ord = { rogue: 0, netdev: 1, nas: 2, probe: 3, pc: 4, mobile: 5, camera: 6 };
+    return { key: 'role_' + nd.role, title: rm.icon + ' ' + rm.label, order: ord[nd.role] ?? 9, crit: nd.role === 'rogue' };
+  }
+  if (mode === 'vendor') {
+    let v = (h.vendor || '未知厂商').split('(')[0].split('/')[0].trim();
+    if (!v || v.startsWith('通用网卡')) v = '通用/未识别网卡';
+    return { key: 'ven_' + v, title: '🏭 ' + v, order: nd.status === 'crit' ? 0 : 5, crit: nd.status === 'crit' };
+  }
+  // mode === 'subnet'
+  const ip = nd.id || '';
+  const parts = ip.split('.');
+  if (h.isLocal === false && parts.length === 4) {
+    const sub = parts[0] + '.' + parts[1] + '.' + parts[2] + '.x';
+    return { key: 'sub_for_' + sub, title: '⚠️ 异网段窜入 (' + sub + ')', order: 0, crit: true };
+  }
+  if (parts.length === 4) {
+    const last = parseInt(parts[3], 10) || 0;
+    const bucket = Math.floor((Math.max(1, last) - 1) / 50);
+    const lo = bucket * 50 + 1, hi = Math.min(254, (bucket + 1) * 50);
+    const prefix = parts[0] + '.' + parts[1] + '.' + parts[2];
+    return { key: 'sub_loc_' + bucket, title: `🌐 ${prefix}.${lo} ~ .${hi}`, order: 1 + bucket, crit: false };
+  }
+  return { key: 'sub_other', title: '🌐 其他设备', order: 9, crit: false };
+}
+
+function layoutGrouped(nodes, edges, W, H, hasUpstream) {
+  const cx = W / 2;
+  const wan = nodes.find(n => n.id === 'WAN_INTERNET');
+  const up = nodes.find(n => n.id === 'UPSTREAM_GW');
+  const gw = nodes.find(n => n.role === 'gateway');
+  const sw = nodes.find(n => n.id === 'LAN_SWITCH_CORE');
+
+  if (hasUpstream && up) {
+    if (wan) { wan.x = cx - 220; wan.y = 46; }
+    up.x = cx - 40; up.y = 46;
+    if (gw) { gw.x = cx + 140; gw.y = 46; }
+    if (sw) { sw.x = cx + 310; sw.y = 46; }
+  } else {
+    if (wan) { wan.x = cx - 180; wan.y = 46; }
+    if (gw) { gw.x = cx; gw.y = 46; }
+    if (sw) { sw.x = cx + 180; sw.y = 46; }
+  }
+
+  const eps = nodes.filter(n => !['WAN_INTERNET', 'UPSTREAM_GW', 'LAN_SWITCH_CORE'].includes(n.id) && n.role !== 'gateway');
+  const map = {};
+  eps.forEach(nd => {
+    const g = classifyEndpointGroup(nd, topoGroupBy);
+    if (!map[g.key]) map[g.key] = { key: g.key, title: g.title, order: g.order, crit: g.crit, nodes: [], critCount: 0, warnCount: 0 };
+    map[g.key].nodes.push(nd);
+    if (nd.status === 'crit') { map[g.key].critCount++; map[g.key].crit = true; map[g.key].order = Math.min(map[g.key].order, 0); }
+    if (nd.status === 'warn') map[g.key].warnCount++;
+  });
+
+  const groups = Object.values(map).sort((a, b) => (a.order - b.order) || (b.critCount - a.critCount) || (b.nodes.length - a.nodes.length));
+  const cellW = 112, cellH = 92, padX = 20, headerH = 36, padBot = 14, gapX = 22, gapY = 22;
+  const maxRowW = Math.max(920, W - 40);
+
+  // Compute each group box size
+  groups.forEach(g => {
+    const isCol = !!collapsedGroups[g.key];
+    g.collapsed = isCol;
+    if (isCol) {
+      g.w = 240;
+      g.h = 52;
+      g.cols = 1;
+    } else {
+      const cols = Math.max(2, Math.min(6, Math.ceil(Math.sqrt(g.nodes.length * 1.4))));
+      const rows = Math.ceil(g.nodes.length / cols);
+      g.cols = cols;
+      g.w = Math.max(230, cols * cellW + padX * 2);
+      g.h = headerH + rows * cellH + padBot;
+    }
+  });
+
+  // Pack group boxes into clean rows
+  let curX = 24, curY = 115, rowMaxH = 0;
+  const rowItems = [];
+  const flushRow = () => {
+    if (rowItems.length === 0) return;
+    const totalW = rowItems.reduce((s, it) => s + it.w, 0) + (rowItems.length - 1) * gapX;
+    let startX = cx - totalW / 2;
+    rowItems.forEach(it => {
+      it.x = startX;
+      it.y = curY;
+      startX += it.w + gapX;
+    });
+    curY += rowMaxH + gapY;
+    rowItems.length = 0;
+    rowMaxH = 0;
+    curX = 24;
+  };
+
+  groups.forEach(g => {
+    if (rowItems.length > 0 && (curX + g.w > maxRowW)) {
+      flushRow();
+    }
+    rowItems.push(g);
+    curX += g.w + gapX;
+    if (g.h > rowMaxH) rowMaxH = g.h;
+  });
+  flushRow();
+
+  // Position nodes inside each group (or hide when collapsed)
+  const hiddenIds = new Set();
+  groups.forEach(g => {
+    topoGroupBoxes.push({
+      key: g.key, title: g.title, x: g.x, y: g.y, w: g.w, h: g.h, headerH,
+      count: g.nodes.length, critCount: g.critCount, warnCount: g.warnCount,
+      crit: g.crit, collapsed: g.collapsed
+    });
+    if (g.collapsed) {
+      g.nodes.forEach(nd => hiddenIds.add(nd.id));
+    } else {
+      g.nodes.forEach((nd, idx) => {
+        const r = Math.floor(idx / g.cols);
+        const c = idx % g.cols;
+        const rowCnt = Math.min(g.cols, g.nodes.length - r * g.cols);
+        const innerW = rowCnt * cellW;
+        const startX = g.x + (g.w - innerW) / 2 + cellW / 2;
+        nd.x = startX + c * cellW;
+        nd.y = g.y + headerH + r * cellH + 34;
+        nodePositions[nd.id] = { x: nd.x, y: nd.y, pinned: false };
+      });
+    }
+  });
+
+  if (hiddenIds.size > 0) {
+    for (let i = nodes.length - 1; i >= 0; i--) {
+      if (hiddenIds.has(nodes[i].id)) nodes.splice(i, 1);
+    }
+  }
+  // In grouped mode, hide noisy switch->endpoint spokes unless node is anomalous/active/selected so groups stay ultra-clean
+  for (let i = edges.length - 1; i >= 0; i--) {
+    const e = edges[i];
+    if (hiddenIds.has(e.from) || hiddenIds.has(e.to)) {
+      edges.splice(i, 1);
+    } else if (e.from === 'LAN_SWITCH_CORE' && e.type === 'lan' && e.kbps < 2 && e.to !== selectedNodeId) {
+      edges.splice(i, 1);
+    }
+  }
+}
+
 function layoutHierarchical(nodes, epCount, W, H, hasUpstream) {
   const cx = W / 2;
-  const setPos = (nd, x, y) => {
-    // Keep existing node coordinates locked so nodes never jump on live updates
+  const placed = [];
+  const setPos = (nd, x, y, avoidOverlap) => {
     if (nodePositions[nd.id]) {
       nd.x = nodePositions[nd.id].x;
       nd.y = nodePositions[nd.id].y;
     } else {
-      nd.x = x;
-      nd.y = y;
-      nodePositions[nd.id] = { x, y, pinned: false };
+      const pos = avoidOverlap ? findNonOverlappingPos(x, y, placed, 90) : { x, y };
+      nd.x = pos.x;
+      nd.y = pos.y;
+      nodePositions[nd.id] = { x: pos.x, y: pos.y, pinned: false };
     }
+    placed.push({ x: nd.x, y: nd.y });
   };
 
   const wan = nodes.find(n => n.id === 'WAN_INTERNET');
@@ -3940,7 +4528,7 @@ function layoutHierarchical(nodes, epCount, W, H, hasUpstream) {
       const x = row.length === 1 ? cx : (leftX + (cIdx / (row.length - 1)) * usableW);
       // Slight vertical stagger on dense rows so labels never collide
       const stagger = (row.length >= 7 && cIdx % 2 === 1) ? 22 : 0;
-      setPos(nd, x, y + stagger);
+      setPos(nd, x, y + stagger, true);
     });
   });
 }
@@ -3948,16 +4536,18 @@ function layoutHierarchical(nodes, epCount, W, H, hasUpstream) {
 function layoutRadial(nodes, epCount, W, H, hasUpstream) {
   const cx = W / 2;
   const cy = H / 2 + 25;
-  const setPos = (nd, x, y) => {
-    // Keep existing node coordinates locked so nodes never jump on live updates
+  const placed = [];
+  const setPos = (nd, x, y, avoidOverlap) => {
     if (nodePositions[nd.id]) {
       nd.x = nodePositions[nd.id].x;
       nd.y = nodePositions[nd.id].y;
     } else {
-      nd.x = x;
-      nd.y = y;
-      nodePositions[nd.id] = { x, y, pinned: false };
+      const pos = avoidOverlap ? findNonOverlappingPos(x, y, placed, 86) : { x, y };
+      nd.x = pos.x;
+      nd.y = pos.y;
+      nodePositions[nd.id] = { x: pos.x, y: pos.y, pinned: false };
     }
+    placed.push({ x: nd.x, y: nd.y });
   };
 
   const wan = nodes.find(n => n.id === 'WAN_INTERNET');
@@ -3986,7 +4576,7 @@ function layoutRadial(nodes, epCount, W, H, hasUpstream) {
     const ringScale = (count > 12 && idx % 2 === 1) ? 0.72 : 1.0;
     const x = cx + Math.cos(angle) * rx * ringScale;
     const y = cy + Math.sin(angle) * ry * ringScale + 20;
-    setPos(nd, x, y);
+    setPos(nd, x, y, true);
   });
 }
 
@@ -4017,11 +4607,57 @@ function drawTopologyFrame() {
     const nodeMap = {};
     topoGraphNodes.forEach(n => nodeMap[n.id] = n);
 
+    // 0. Draw Smart Group Swimlane Boxes (when in 'group' layout)
+    if (topoGroupBoxes && topoGroupBoxes.length > 0) {
+      topoGroupBoxes.forEach(g => {
+        ctx.save();
+        const r = 10;
+        ctx.beginPath();
+        ctx.moveTo(g.x + r, g.y);
+        ctx.lineTo(g.x + g.w - r, g.y);
+        ctx.quadraticCurveTo(g.x + g.w, g.y, g.x + g.w, g.y + r);
+        ctx.lineTo(g.x + g.w, g.y + g.h - r);
+        ctx.quadraticCurveTo(g.x + g.w, g.y + g.h, g.x + g.w - r, g.y + g.h);
+        ctx.lineTo(g.x + r, g.y + g.h);
+        ctx.quadraticCurveTo(g.x, g.y + g.h, g.x, g.y + g.h - r);
+        ctx.lineTo(g.x, g.y + r);
+        ctx.quadraticCurveTo(g.x, g.y, g.x + r, g.y);
+        ctx.closePath();
+        ctx.fillStyle = g.crit ? 'rgba(239, 68, 68, 0.08)' : 'rgba(28, 31, 38, 0.72)';
+        ctx.fill();
+        ctx.lineWidth = g.crit ? 1.8 : 1.2;
+        ctx.strokeStyle = g.crit ? 'rgba(239, 68, 68, 0.65)' : 'rgba(108, 108, 245, 0.35)';
+        ctx.stroke();
+
+        // Header bar background
+        ctx.fillStyle = g.crit ? 'rgba(239, 68, 68, 0.16)' : 'rgba(108, 108, 245, 0.14)';
+        ctx.fillRect(g.x + 1, g.y + 1, g.w - 2, g.headerH - 2);
+
+        // Title & count
+        ctx.font = 'bold 12.5px -apple-system, Microsoft YaHei, sans-serif';
+        ctx.fillStyle = g.crit ? '#fca5a5' : '#e0e7ff';
+        ctx.textAlign = 'left';
+        ctx.textBaseline = 'middle';
+        const arrow = g.collapsed ? '▸' : '▾';
+        ctx.fillText(`${arrow} ${g.title}`, g.x + 12, g.y + g.headerH / 2);
+
+        const badgeTxt = g.critCount > 0 ? `${g.count}台 (异常${g.critCount})` : `${g.count}台`;
+        ctx.font = '11.5px -apple-system, Microsoft YaHei, sans-serif';
+        ctx.fillStyle = g.crit ? '#fca5a5' : '#9aa0a6';
+        ctx.textAlign = 'right';
+        ctx.fillText(badgeTxt, g.x + g.w - 12, g.y + g.headerH / 2);
+        ctx.restore();
+      });
+    }
+
     // 1. Draw Edges & Animated Particles
     topoGraphEdges.forEach((e, eIdx) => {
       const n1 = nodeMap[e.from];
       const n2 = nodeMap[e.to];
       if (!n1 || !n2) return;
+      const edgeDim = topoSearchQuery && !(nodeMatchesSearch(n1, topoSearchQuery) || nodeMatchesSearch(n2, topoSearchQuery));
+      ctx.save();
+      if (edgeDim) ctx.globalAlpha = 0.14;
 
       ctx.beginPath();
       if (e.type === 'p2p') {
@@ -4077,12 +4713,24 @@ function drawTopologyFrame() {
         ctx.textAlign = 'center';
         ctx.fillText(e.label, lx, ly);
       }
+      ctx.restore();
     });
 
     // 2. Draw Nodes
     topoGraphNodes.forEach(n => {
       const rm = ROLE_META[n.role] || ROLE_META.pc;
       const isSelected = n.id === selectedNodeId;
+      const isSearchMatch = !topoSearchQuery || nodeMatchesSearch(n, topoSearchQuery);
+      ctx.save();
+      if (!isSearchMatch) ctx.globalAlpha = 0.18;
+
+      if (topoSearchQuery && isSearchMatch) {
+        ctx.beginPath();
+        ctx.arc(n.x, n.y, n.radius + 9, 0, Math.PI * 2);
+        ctx.strokeStyle = 'rgba(56, 189, 248, 0.9)';
+        ctx.lineWidth = 2.6;
+        ctx.stroke();
+      }
 
       // Radiating sonar / soundwave rings for anomalous (crit / warn) nodes
       if (n.status === 'crit' || n.status === 'warn') {
@@ -4133,6 +4781,7 @@ function drawTopologyFrame() {
       ctx.font = '11px Consolas, Monaco, monospace';
       ctx.fillStyle = n.status === 'crit' ? '#fca5a5' : '#94a3b8';
       ctx.fillText(n.sub, n.x, n.y + n.radius + 29);
+      ctx.restore();
     });
 
     ctx.restore();
@@ -4140,7 +4789,9 @@ function drawTopologyFrame() {
   requestAnimationFrame(drawTopologyFrame);
 }
 
-function renderInspector(nodeId) {
+let lastInspectorNodeId = null;
+
+function renderInspector(nodeId, forceRebuild) {
   if (!lastStatus) return;
   const nd = topoGraphNodes.find(n => n.id === nodeId);
   const h = (lastStatus.hosts || []).find(x => x.ip === nodeId) || (nd ? nd.raw : null);
@@ -4148,6 +4799,7 @@ function renderInspector(nodeId) {
   const badge = document.getElementById('inspBadge');
   if (!h) {
     body.innerHTML = '未找到该节点详情，请点击拓扑图中的其他节点。';
+    lastInspectorNodeId = null;
     return;
   }
 
@@ -4157,8 +4809,10 @@ function renderInspector(nodeId) {
   badge.className = 'tag ' + (nodeAlerts.length > 0 || h.isLocal === false ? 'critical' : 'ok');
 
   const peerLinks = (lastStatus.links || []).filter(l => l.src === h.ip || l.dst === h.ip);
+  const isRealIp = /^\d+\.\d+\.\d+\.\d+$/.test(h.ip || '') && h.role !== 'internet' && h.role !== 'switch';
 
-  let html = `
+  // Build dynamic metrics HTML
+  let metricsHtml = `
     <div style='display:flex;align-items:center;gap:10px;background:rgba(15,23,42,0.7);padding:10px 12px;border-radius:8px;border:1px solid var(--border);'>
       <div style='font-size:26px;'>${rm.icon}</div>
       <div>
@@ -4181,7 +4835,7 @@ function renderInspector(nodeId) {
   `;
 
   if (h.activities) {
-    html += `
+    metricsHtml += `
       <div class='fix-box'>
         <div style='color:var(--accent);font-weight:600;margin-bottom:2px;'>🌐 近期访问域名 / 协议活动</div>
         <div class='mono' style='font-size:12px;color:#e2e8f0;word-break:break-all;'>${h.activities.split(' | ').join('<br>')}</div>
@@ -4190,7 +4844,7 @@ function renderInspector(nodeId) {
   }
 
   if (peerLinks.length > 0) {
-    html += `
+    metricsHtml += `
       <div class='fix-box'>
         <div style='color:#d8b4fe;font-weight:600;margin-bottom:2px;'>🔗 活跃拓扑通信链路 (${peerLinks.length})</div>
         ${peerLinks.slice(0, 6).map(l => {
@@ -4202,7 +4856,7 @@ function renderInspector(nodeId) {
   }
 
   if (nodeAlerts.length > 0) {
-    html += nodeAlerts.map(a => `
+    metricsHtml += nodeAlerts.map(a => `
       <div class='fix-box' style='border-color:var(--crit);background:rgba(239,68,68,0.1)'>
         <div style='color:#fca5a5;font-weight:700;'>🚨 ${a.title}</div>
         <div style='font-size:12px;color:#cbd5e1;'>${a.evidence}</div>
@@ -4210,10 +4864,124 @@ function renderInspector(nodeId) {
       </div>
     `).join('');
   } else {
-    html += `<div style='font-size:12.5px;color:var(--ok);background:rgba(16,185,129,0.1);padding:8px 10px;border-radius:6px;'>✓ 该节点当前各项网络包指标正常，未发现冲突、风暴或丢包异常。</div>`;
+    metricsHtml += `<div style='font-size:12.5px;color:var(--ok);background:rgba(16,185,129,0.1);padding:8px 10px;border-radius:6px;'>✓ 该节点当前各项网络包指标正常，未发现冲突、风暴或丢包异常。</div>`;
   }
 
-  body.innerHTML = html;
+  // Only rebuild the interactive messaging/probe box when switching to a different node so user typing is never wiped on 1s refresh
+  const existingMetrics = document.getElementById('inspMetricsBox');
+  if (!forceRebuild && lastInspectorNodeId === h.ip && existingMetrics) {
+    existingMetrics.innerHTML = metricsHtml;
+    return;
+  }
+  lastInspectorNodeId = h.ip;
+
+  let actionHtml = '';
+  if (isRealIp) {
+    actionHtml = `
+      <div class='fix-box' style='border-color:rgba(108,108,245,0.45);background:rgba(108,108,245,0.08);gap:8px;'>
+        <div style='display:flex;justify-content:space-between;align-items:center;'>
+          <span style='color:#c7c7ff;font-weight:700;font-size:13px;'>💬 定位找人 / 快捷发消息</span>
+          <div style='display:flex;gap:5px;'>
+            <button class='quick-msg-btn' onclick='probeHostDeep(""${h.ip}"")' title='主动探测 NetBIOS 主机名、开放端口与 Web 管理页标题'>🔎 深度侦察</button>
+            <a href='http://${h.ip}' target='_blank' class='quick-msg-btn' style='text-decoration:none;'>🌐 打开Web</a>
+          </div>
+        </div>
+        <div id='probeResultBox' class='hidden' style='font-size:12px;background:#14161a;border:1px solid var(--border);border-radius:6px;padding:7px 9px;color:#e2e8f0;'></div>
+        <div style='display:flex;flex-wrap:wrap;gap:5px;'>
+          <button class='quick-msg-btn' onclick='fillAndSendMsg(""${h.ip}"", ""【网管通知】请确认您正在使用的电脑(IP:${h.ip})，方便联系IT核对网络归属，谢谢！"")'>📢 核对归属</button>
+          <button class='quick-msg-btn' onclick='fillAndSendMsg(""${h.ip}"", ""【网管提醒】您的电脑(${h.ip})当前带宽或连接数较高，请检查是否有后台下载工具。"")'>⚠️ 流量提醒</button>
+          <button class='quick-msg-btn' onclick='fillAndSendMsg(""${h.ip}"", ""【网管通知】正在排查局域网线路故障，请暂时不要插拔网线，如有疑问联系IT。"")'>🔌 线路排查</button>
+        </div>
+        <div style='display:flex;gap:6px;'>
+          <input id='msgInput' type='text' placeholder='输入要弹窗发送给对方屏幕的消息...' style='flex:1;padding:5px 8px;font-size:12px;'>
+          <button style='padding:5px 10px;font-size:12px;white-space:nowrap;' onclick='sendNodeMsg(""${h.ip}"")'>📤 发送</button>
+        </div>
+        <details style='font-size:11.5px;color:var(--muted);'>
+          <summary style='cursor:pointer;'>🔑 可选：填写目标 Windows 管理员凭据 (解决权限拒绝)</summary>
+          <div style='display:flex;gap:6px;margin-top:6px;'>
+            <input id='msgUser' type='text' placeholder='用户名(如 Administrator)' style='flex:1;padding:4px 7px;font-size:12px;'>
+            <input id='msgPass' type='password' placeholder='密码' style='flex:1;padding:4px 7px;font-size:12px;'>
+          </div>
+        </details>
+        <div id='msgResultBox' class='hidden' style='font-size:12px;padding:6px 8px;border-radius:6px;'></div>
+      </div>
+    `;
+  }
+
+  body.innerHTML = `<div id='inspMetricsBox' style='display:flex;flex-direction:column;gap:12px;'>${metricsHtml}</div>${actionHtml}`;
+}
+
+function fillAndSendMsg(ip, text) {
+  const inp = document.getElementById('msgInput');
+  if (inp) inp.value = text;
+  sendNodeMsg(ip);
+}
+
+async function sendNodeMsg(ip) {
+  const inp = document.getElementById('msgInput');
+  const resBox = document.getElementById('msgResultBox');
+  const msg = inp ? inp.value.trim() : '';
+  if (!msg) {
+    if (resBox) {
+      resBox.classList.remove('hidden');
+      resBox.style.background = 'rgba(245,158,11,0.15)';
+      resBox.style.color = '#fcd34d';
+      resBox.textContent = '请先输入消息内容，或点击上方快捷模板按钮。';
+    }
+    return;
+  }
+  const user = (document.getElementById('msgUser') || {}).value || '';
+  const pass = (document.getElementById('msgPass') || {}).value || '';
+  if (resBox) {
+    resBox.classList.remove('hidden');
+    resBox.style.background = 'rgba(108,108,245,0.15)';
+    resBox.style.color = '#c7c7ff';
+    resBox.textContent = '⏳ 正在向 ' + ip + ' 推送 Windows 桌面弹窗消息...';
+  }
+  try {
+    const qs = `ip=${encodeURIComponent(ip)}&msg=${encodeURIComponent(msg)}&user=${encodeURIComponent(user)}&pass=${encodeURIComponent(pass)}`;
+    const r = await fetch('/api/send-msg?' + qs);
+    const d = await r.json();
+    if (resBox) {
+      resBox.style.background = d.ok ? 'rgba(16,185,129,0.16)' : 'rgba(239,68,68,0.14)';
+      resBox.style.color = d.ok ? '#6ee7b7' : '#fca5a5';
+      resBox.innerHTML = `<b>${d.ok ? '✓ ' : '✗ '}${d.detail || ''}</b>${d.hint ? ('<div style=""color:#cbd5e1;margin-top:3px;font-size:11.5px;"">' + d.hint + '</div>') : ''}`;
+    }
+  } catch (e) {
+    if (resBox) {
+      resBox.style.background = 'rgba(239,68,68,0.14)';
+      resBox.style.color = '#fca5a5';
+      resBox.textContent = '✗ 请求发送失败: ' + e;
+    }
+  }
+}
+
+async function probeHostDeep(ip) {
+  const box = document.getElementById('probeResultBox');
+  if (box) {
+    box.classList.remove('hidden');
+    box.innerHTML = '⏳ 正在主动探测 NetBIOS 主机名、开放端口与 Web 页面标题...';
+  }
+  try {
+    const r = await fetch('/api/probe-host?ip=' + encodeURIComponent(ip));
+    const d = await r.json();
+    if (box) {
+      if (!d.ok) {
+        box.textContent = '探测失败: ' + (d.error || '未知错误');
+      } else {
+        const portsStr = (d.ports && d.ports.length > 0) ? d.ports.join(', ') : '未检出常见开放端口';
+        box.innerHTML = `
+          <div><b>身份推断：</b><span style='color:#6ee7b7;'>${d.guess}</span></div>
+          <div><b>NetBIOS / DNS：</b>${d.netbios || '-'} / ${d.dns || '-'}</div>
+          <div><b>Web 标题：</b>${d.httpTitle || '无'}</div>
+          <div><b>开放端口：</b><span class='mono'>${portsStr}</span></div>
+        `;
+      }
+    }
+    fetchStatus();
+  } catch (e) {
+    if (box) box.textContent = '探测异常: ' + e;
+  }
 }
 
 function initTopoEvents() {
@@ -4231,6 +4999,20 @@ function initTopoEvents() {
 
   c.addEventListener('mousedown', e => {
     const { wx, wy } = toWorld(e.clientX, e.clientY);
+    // Check if user clicked a smart group header to collapse/expand
+    if (topoLayout === 'group' && topoGroupBoxes && topoGroupBoxes.length > 0) {
+      for (let i = 0; i < topoGroupBoxes.length; i++) {
+        const g = topoGroupBoxes[i];
+        if (wx >= g.x && wx <= g.x + g.w && wy >= g.y && wy <= g.y + g.headerH) {
+          collapsedGroups[g.key] = !collapsedGroups[g.key];
+          if (lastStatus) {
+            rebuildTopologyGraph(lastStatus);
+            fitTopologyToView();
+          }
+          return;
+        }
+      }
+    }
     let hit = null;
     for (let i = topoGraphNodes.length - 1; i >= 0; i--) {
       const n = topoGraphNodes[i];
@@ -4334,15 +5116,6 @@ function drawChart(hist) {
   ctx.stroke();
 }
 
-async function applyAdapter() {
-  const id = document.getElementById('adapterSel').value;
-  const cidr = document.getElementById('cidrInput').value.trim();
-  await fetch('/api/switch?id=' + encodeURIComponent(id) + '&cidr=' + encodeURIComponent(cidr));
-  adapterInitialized = false;
-  resetNodePositions();
-  fetchStatus();
-}
-
 async function triggerScan() {
   await fetch('/api/scan');
   setTimeout(fetchStatus, 1500);
@@ -4360,8 +5133,8 @@ async function togglePause() {
 
 async function resetAllStats() {
   await fetch('/api/reset-all');
-  adapterInitialized = false;
-  resetNodePositions();
+  cidrInitialized = false;
+  autoArrangeTopology();
   fetchStatus();
 }
 
