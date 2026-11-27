@@ -156,6 +156,29 @@ namespace LanGuardian
         public string UpdatedAt = "";
     }
 
+    public class GhostHostRecord
+    {
+        public string Ip = "";
+        public string Mac = "";
+        public string Vendor = "";
+        public string Hostname = "";
+        public string Role = "pc";
+        public bool IsLocal = true;
+        public double TotalMB = 0;
+        public DateTime LastSeen = DateTime.Now;
+    }
+
+    public class HostTrendPoint
+    {
+        public string Time = "";
+        public int Total = 0;
+        public int Pc = 0;
+        public int Mobile = 0;
+        public int NetDev = 0;
+        public int Camera = 0;
+        public int Rogue = 0;
+    }
+
     internal static class NativeWin
     {
         [DllImport("iphlpapi.dll", ExactSpelling = true)]
@@ -313,12 +336,15 @@ namespace LanGuardian
 
     public class MonitorEngine
     {
-        public const string AppVersion = "v1.7.1";
+        public const string AppVersion = "v1.8.0";
         public string LogDirectory = "";
         private readonly object _logLock = new object();
         private readonly object _notesLock = new object();
         public ConcurrentDictionary<string, DeviceNote> DeviceNotes = new ConcurrentDictionary<string, DeviceNote>(StringComparer.OrdinalIgnoreCase);
         public ConcurrentDictionary<string, string> MacToObservedHostname = new ConcurrentDictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        public ConcurrentDictionary<string, GhostHostRecord> Recent24hHosts = new ConcurrentDictionary<string, GhostHostRecord>(StringComparer.OrdinalIgnoreCase);
+        public ConcurrentQueue<HostTrendPoint> HostTrendHistory = new ConcurrentQueue<HostTrendPoint>();
+        private int _trendTick = 55; // sample first point ~5s after start, then every 60s
         private readonly ConcurrentDictionary<string, DateTime> _lastAlertLogTime = new ConcurrentDictionary<string, DateTime>();
         private int _summaryTick = 0;
 
@@ -1584,6 +1610,7 @@ namespace LanGuardian
                         // Foreign/cross-subnet rogue nodes vanish from live topology after 180s of silence; normal LAN hosts after 300s (5 min)
                         if (!hh.IsLocalSubnet && idleSec > 180)
                         {
+                            RecordGhostSnapshot(hh);
                             HostStats removedH;
                             if (Hosts.TryRemove(hKv.Key, out removedH))
                             {
@@ -1593,8 +1620,51 @@ namespace LanGuardian
                         }
                         else if (hh.IsLocalSubnet && !hh.IsGateway && !LocalHostIps.Contains(hh.Ip) && idleSec > 300)
                         {
+                            RecordGhostSnapshot(hh);
                             HostStats removedH;
                             Hosts.TryRemove(hKv.Key, out removedH);
+                        }
+                    }
+
+                    // Sample 24h online host trend every 60 seconds (and keep 24h ghost cache fresh)
+                    _trendTick++;
+                    if (_trendTick >= 60)
+                    {
+                        _trendTick = 0;
+                        int cntPc = 0, cntMob = 0, cntNet = 0, cntCam = 0, cntRogue = 0;
+                        foreach (var hh in Hosts.Values)
+                        {
+                            RecordGhostSnapshot(hh);
+                            string r = InferRole(hh);
+                            if (r == "rogue") cntRogue++;
+                            else if (r == "mobile") cntMob++;
+                            else if (r == "camera") cntCam++;
+                            else if (r == "gateway" || r == "netdev" || r == "nas") cntNet++;
+                            else cntPc++;
+                        }
+                        HostTrendHistory.Enqueue(new HostTrendPoint
+                        {
+                            Time = nowDt.ToString("HH:mm"),
+                            Total = Hosts.Count,
+                            Pc = cntPc,
+                            Mobile = cntMob,
+                            NetDev = cntNet,
+                            Camera = cntCam,
+                            Rogue = cntRogue
+                        });
+                        while (HostTrendHistory.Count > 1440)
+                        {
+                            HostTrendPoint _tp;
+                            HostTrendHistory.TryDequeue(out _tp);
+                        }
+                        // Prune 24h ghost records older than 24 hours
+                        foreach (var gk in Recent24hHosts.ToArray())
+                        {
+                            if ((nowDt - gk.Value.LastSeen).TotalHours > 24.0)
+                            {
+                                GhostHostRecord _gr;
+                                Recent24hHosts.TryRemove(gk.Key, out _gr);
+                            }
                         }
                     }
 
@@ -2289,6 +2359,22 @@ namespace LanGuardian
             }
             lossPct = (tries - ok) * 100.0 / tries;
             return ok > 0 ? (double)totalMs / ok : -1;
+        }
+
+        public void RecordGhostSnapshot(HostStats h)
+        {
+            if (h == null || string.IsNullOrEmpty(h.Ip)) return;
+            Recent24hHosts[h.Ip] = new GhostHostRecord
+            {
+                Ip = h.Ip,
+                Mac = h.Mac,
+                Vendor = h.Vendor,
+                Hostname = h.Hostname,
+                Role = InferRole(h),
+                IsLocal = h.IsLocalSubnet,
+                TotalMB = (h.TotalTxBytes + h.TotalRxBytes) / (1024.0 * 1024.0),
+                LastSeen = h.LastSeen
+            };
         }
 
         public HostStats GetOrAddHost(string ip, string mac, bool touchLastSeen = true)
@@ -3454,6 +3540,37 @@ namespace LanGuardian
             }
             sb.Append("]},");
 
+            // 24h Offline Ghost Hosts (seen in last 24h but currently aged out)
+            sb.Append("\"ghostHosts\":[");
+            var ghosts = _engine.Recent24hHosts.Values
+                .Where(g => !_engine.Hosts.ContainsKey(g.Ip) && (DateTime.Now - g.LastSeen).TotalHours <= 24.0)
+                .OrderByDescending(g => g.LastSeen)
+                .Take(200)
+                .ToList();
+            for (int i = 0; i < ghosts.Count; i++)
+            {
+                var g = ghosts[i];
+                if (i > 0) sb.Append(",");
+                var gdn = _engine.LookupNote(g.Mac, g.Ip);
+                sb.AppendFormat("{{\"ip\":\"{0}\",\"mac\":\"{1}\",\"vendor\":\"{2}\",\"hostname\":\"{3}\",\"role\":\"{4}\",\"isLocal\":{5},\"totalMB\":{6:F2},\"lastSeen\":\"{7}\",\"alias\":\"{8}\",\"owner\":\"{9}\",\"location\":\"{10}\",\"userNote\":\"{11}\"}}",
+                    Esc(g.Ip), Esc(g.Mac), Esc(g.Vendor), Esc(g.Hostname), Esc(g.Role),
+                    g.IsLocal ? "true" : "false", g.TotalMB, g.LastSeen.ToString("HH:mm:ss"),
+                    Esc(gdn != null ? gdn.Alias : ""), Esc(gdn != null ? gdn.Owner : ""), Esc(gdn != null ? gdn.Location : ""), Esc(gdn != null ? gdn.Note : ""));
+            }
+            sb.Append("],");
+
+            // 24h Online Host Count Trend (by role)
+            sb.Append("\"hostTrend\":[");
+            var trendArr = _engine.HostTrendHistory.ToArray();
+            for (int i = 0; i < trendArr.Length; i++)
+            {
+                var tp = trendArr[i];
+                if (i > 0) sb.Append(",");
+                sb.AppendFormat("{{\"t\":\"{0}\",\"tot\":{1},\"pc\":{2},\"mob\":{3},\"net\":{4},\"cam\":{5},\"rog\":{6}}}",
+                    Esc(tp.Time), tp.Total, tp.Pc, tp.Mobile, tp.NetDev, tp.Camera, tp.Rogue);
+            }
+            sb.Append("],");
+
             // Active Topology Links
             sb.Append("\"links\":[");
             var links = _engine.ActiveLinks.Values
@@ -3543,102 +3660,51 @@ button.secondary { background: #20242c; border-color: var(--border); color: var(
 button.secondary:hover { background: #2b303b; border-color: #3d4454; }
 button.secondary.active { background: rgba(108,108,245,0.22); border-color: #6c6cf5; color: #fff; }
 
-/* Concave Radio Tabs Navigation (From Uiverse.io by german_7619, integrated into Dark Theme) */
+/* Clean Modern Dark-Theme Folder Tabs (Zero sub-pixel seams or overlap) */
 .nav-shell { position: relative; margin-bottom: 16px; }
-.nav-header-row { display: flex; align-items: flex-end; justify-content: space-between; flex-wrap: wrap; gap: 10px; background: #6c6cf5; border-top-left-radius: 0.5rem; border-top-right-radius: 0.5rem; padding: 0 1rem 0 0; }
-.radio-inputs {
-  position: relative;
-  display: flex;
-  border-top-left-radius: 0.5rem;
-  border-top-right-radius: 0.5rem;
-  background-color: #6c6cf5;
-  font-size: 14px;
-  padding: 0.5rem 1.5rem 0 1.5rem;
-  gap: 4px;
-}
+.nav-header-row { display: flex; align-items: flex-end; justify-content: space-between; flex-wrap: wrap; gap: 10px; background: #1c1f26; border: 1px solid var(--border); border-bottom: none; border-radius: 10px 10px 0 0; padding: 8px 14px 0 12px; }
+.radio-inputs { position: relative; display: flex; align-items: flex-end; gap: 6px; font-size: 13.5px; flex-wrap: wrap; }
 .radio-inputs .radio input { display: none; }
 .radio-inputs .radio .name {
-  display: flex;
-  cursor: pointer;
-  align-items: center;
-  justify-content: center;
-  border: none;
-  transition: all 0.15s ease-in-out;
-  position: relative;
-  border-top-left-radius: 0.5rem;
-  border-top-right-radius: 0.5rem;
-  color: rgba(255,255,255,0.88);
-}
-.radio-inputs .radio input + .name:hover { color: #fff; }
-.radio-inputs .radio input + .name .pre-name,
-.radio-inputs .radio input + .name .pos-name {
-  content: '';
-  position: absolute;
-  width: 10px;
-  height: 10px;
-  background-color: #6c6cf5;
-  bottom: 0;
-  opacity: 0;
-  pointer-events: none;
-}
-.radio-inputs .radio input + .name .pre-name {
-  right: -10px;
-  border-bottom-left-radius: 300px;
-  box-shadow: -3px 3px 0px 3px #e8e8e8;
-}
-.radio-inputs .radio input + .name .pos-name {
-  left: -10px;
-  border-bottom-right-radius: 300px;
-  box-shadow: 3px 3px 0px 3px #e8e8e8;
-}
-.radio-inputs .radio input:checked + .name {
-  animation: name-activated;
-  animation-duration: 0.1s;
-  animation-fill-mode: forwards;
-}
-@keyframes name-activated {
-  from { background-color: #6c6cf5; font-weight: 400; cursor: pointer; color: white; }
-  to { background-color: #e8e8e8; font-weight: 600; cursor: default; color: black; }
-}
-.radio-inputs .radio input:checked + .name .pre-name,
-.radio-inputs .radio input:checked + .name .pos-name {
-  animation: name-border-activated;
-  animation-duration: 0.1s;
-  animation-fill-mode: forwards;
-  z-index: 0;
-}
-@keyframes name-border-activated {
-  from { opacity: 0; }
-  to { opacity: 1; }
-}
-.radio-inputs .radio .name span:last-child {
-  z-index: 1;
-  padding: 0.5rem 0.9rem;
-  border-top-left-radius: 0.5rem;
-  border-top-right-radius: 0.5rem;
   display: inline-flex;
   align-items: center;
   gap: 6px;
+  padding: 9px 16px;
+  cursor: pointer;
+  color: var(--muted);
+  font-weight: 500;
+  border-radius: 8px 8px 0 0;
+  border: 1px solid transparent;
+  border-bottom: none;
+  background: transparent;
+  transition: color 0.15s, background 0.15s, border-color 0.15s;
+  position: relative;
+  bottom: -1px;
+  user-select: none;
 }
-.radio-inputs .radio input:checked + .name span:last-child {
-  animation: name-text-activated;
-  animation-duration: 0.1s;
-  animation-fill-mode: forwards;
+.radio-inputs .radio .name:hover { color: #fff; background: rgba(108,108,245,0.1); }
+.radio-inputs .radio input:checked + .name {
+  background: var(--bg);
+  color: #fff;
+  font-weight: 600;
+  border-color: var(--border);
+  box-shadow: inset 0 2.5px 0 0 #6c6cf5;
+  z-index: 2;
 }
-@keyframes name-text-activated {
-  from { background-color: #6c6cf5; }
-  to { background-color: #e8e8e8; }
-}
-@keyframes content-activated {
-  from { opacity: 0; }
-  to { opacity: 1; }
-}
-.tab-badge { font-size: 11px; padding: 1px 7px; border-radius: 99px; background: rgba(0,0,0,0.22); color: #fff; font-weight: 600; }
+@keyframes content-activated { from { opacity: 0; } to { opacity: 1; } }
+.tab-badge { font-size: 11px; padding: 1px 7px; border-radius: 99px; background: rgba(148,163,184,0.18); color: #cbd5e1; font-weight: 600; }
 .radio-inputs .radio input:checked + .name .tab-badge { background: #6c6cf5; color: #fff; }
 .tab-badge.crit { background: var(--crit) !important; color: #fff !important; }
-.nav-tip { font-size: 12px; color: rgba(255,255,255,0.9); padding-bottom: 10px; }
-.nav-panel-frame { border: 3px solid #6c6cf5; border-top: 4px solid #e8e8e8; border-bottom-left-radius: 0.5rem; border-bottom-right-radius: 0.5rem; background: var(--bg); padding: 14px; }
-.tab-pane-anim { animation: content-activated 0.45s ease-out forwards; }
+.nav-tip { font-size: 12px; color: var(--muted); padding-bottom: 10px; }
+.nav-panel-frame { border: 1px solid var(--border); border-radius: 0 0 10px 10px; background: var(--bg); padding: 14px; }
+.tab-pane-anim { animation: content-activated 0.25s ease-out forwards; }
+.ghost-toggle { display: inline-flex; align-items: center; gap: 5px; background: #20242c; border: 1px solid var(--border); padding: 5px 10px; border-radius: 6px; font-size: 12.5px; color: #cbd5e1; cursor: pointer; user-select: none; }
+.ghost-toggle:hover { border-color: #6c6cf5; color: #fff; }
+.ghost-toggle.active { background: rgba(148,163,184,0.18); border-color: #94a3b8; color: #fff; }
+.trend-legend { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; }
+.trend-leg-btn { display: inline-flex; align-items: center; gap: 6px; padding: 4px 10px; border-radius: 6px; background: #20242c; border: 1px solid var(--border); font-size: 12px; color: #e2e8f0; cursor: pointer; user-select: none; }
+.trend-leg-btn.off { opacity: 0.38; text-decoration: line-through; }
+.trend-swatch { width: 12px; height: 3px; border-radius: 2px; display: inline-block; }
 
 /* Quick Topology Chain Bar */
 .chain-bar { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; background: var(--card); border: 1px solid var(--border); border-radius: 10px; padding: 10px 16px; margin-bottom: 16px; font-size: 12.5px; }
@@ -3758,36 +3824,28 @@ tr:hover { background: rgba(56,189,248,0.08); }
 <!-- 实时拓扑链路速览条 -->
 <div id='chainBar' class='chain-bar'></div>
 
-<!-- 顶部凹角滑块切换 Tab 栏 + 内容框架 -->
+<!-- 顶部平滑标签页切换栏 + 内容框架 -->
 <div class='nav-shell'>
   <div class='nav-header-row'>
     <div class='radio-inputs'>
       <label class='radio'>
         <input type='radio' name='lg-tab-group' id='tabBtnOverview' checked onchange='switchTab(""overview"")' />
-        <span class='name'>
-          <span class='pre-name'></span>
-          <span class='pos-name'></span>
-          <span>📊 实时监控与故障诊断</span>
-        </span>
+        <span class='name'>📊 实时监控与故障诊断</span>
       </label>
       <label class='radio'>
         <input type='radio' name='lg-tab-group' id='tabBtnTopo' onchange='switchTab(""topology"")' />
-        <span class='name'>
-          <span class='pre-name'></span>
-          <span class='pos-name'></span>
-          <span>🕸️ 网络拓扑与实时态势图 <span id='topoNodeBadge' class='tab-badge'>0</span></span>
-        </span>
+        <span class='name'>🕸️ 网络拓扑与实时态势图 <span id='topoNodeBadge' class='tab-badge'>0</span></span>
+      </label>
+      <label class='radio'>
+        <input type='radio' name='lg-tab-group' id='tabBtnTrend' onchange='switchTab(""trend"")' />
+        <span class='name'>📈 上线趋势</span>
       </label>
       <label class='radio'>
         <input type='radio' name='lg-tab-group' id='tabBtnAlerts' onchange='switchTab(""alerts"")' />
-        <span class='name'>
-          <span class='pre-name'></span>
-          <span class='pos-name'></span>
-          <span>🚨 异常诊断与修正方案 <span id='alertTabBadge' class='tab-badge'>0</span></span>
-        </span>
+        <span class='name'>🚨 异常诊断与修正方案 <span id='alertTabBadge' class='tab-badge'>0</span></span>
       </label>
     </div>
-    <div class='nav-tip'>💡 点击任意主机或拓扑节点可查看单机深度透视与修正建议</div>
+    <div class='nav-tip'>💡 点击任意主机或拓扑节点可查看单机深度透视、打备注与修正建议</div>
   </div>
   <div class='nav-panel-frame'>
 
@@ -3892,6 +3950,10 @@ tr:hover { background: rgba(56,189,248,0.08); }
           <input id='topoSearch' type='text' placeholder='🔍 搜索 IP/网段/品牌/主机名...' style='width:175px;padding:5px 9px;font-size:12.5px;' oninput='onTopoSearchInput()' onkeydown='onTopoSearchKey(event)'>
         </div>
         <div style='display:flex;align-items:center;gap:5px;flex-wrap:wrap;'>
+          <label id='lblGhost24h' class='ghost-toggle' title='勾选后在拓扑图中以单色半透明显示 24 小时内出现过但当前已离线的设备'>
+            <input type='checkbox' id='chkGhost24h' onchange='toggleGhost24h()' style='padding:0;margin:0;width:14px;height:14px;'>
+            <span>👻 24h留影 <span id='ghostCountBadge' style='color:#94a3b8;'>(0)</span></span>
+          </label>
           <button class='secondary' onclick='autoArrangeTopology()' title='立即消除重叠并整齐排列所有节点'>🧹 自动整理</button>
           <button id='btnAutoArrange' class='secondary active' onclick='toggleAutoArrange()' title='新设备加入或出现重叠时自动整理防重叠'>🔄 自动避让: 开</button>
           <button class='secondary' onclick='zoomTopo(1.18)' title='放大'>＋</button>
@@ -3925,7 +3987,54 @@ tr:hover { background: rgba(56,189,248,0.08); }
   </div>
 </div>
 
-<!-- ==================== TAB 3: 异常诊断与修正方案专项视图 ==================== -->
+<!-- ==================== TAB 3: 上线节点趋势分析视图 ==================== -->
+<div id='viewTrend' class='hidden'>
+  <div class='grid-4'>
+    <div class='card'>
+      <div class='card-label'>当前实时在线节点</div>
+      <div id='trNowTotal' class='card-val' style='color:#fff;'>0 台</div>
+      <div id='trNowSub' class='card-sub'>每分钟自动采样记录</div>
+    </div>
+    <div class='card'>
+      <div class='card-label'>24 小时在线峰值</div>
+      <div id='trPeakTotal' class='card-val' style='color:#60a5fa;'>0 台</div>
+      <div id='trPeakTime' class='card-sub'>峰值出现时刻: -</div>
+    </div>
+    <div class='card'>
+      <div class='card-label'>24 小时累计出现设备</div>
+      <div id='tr24hSeen' class='card-val' style='color:#a855f7;'>0 台</div>
+      <div id='tr24hGhost' class='card-sub'>含当前已离线留影设备: 0 台</div>
+    </div>
+    <div class='card'>
+      <div class='card-label'>当前活跃设备构成</div>
+      <div id='trBreakdown' class='card-val' style='font-size:15px;line-height:1.5;margin-top:4px;'>-</div>
+      <div class='card-sub'>电脑 / 手机 / 网络与NAS / 监控 / 异网段</div>
+    </div>
+  </div>
+
+  <div class='card'>
+    <div class='section-title'>
+      <span>📈 局域网在线节点数量变化趋势 (按设备类型分色折线)</span>
+      <div style='display:flex;align-items:center;gap:8px;flex-wrap:wrap;'>
+        <select id='trendRangeSel' onchange='renderHostTrend()' style='padding:4px 10px;font-size:12px;'>
+          <option value='60'>最近 1 小时</option>
+          <option value='360'>最近 6 小时</option>
+          <option value='1440' selected>最近 24 小时 (全部)</option>
+        </select>
+      </div>
+    </div>
+    <div id='trendLegendBar' class='trend-legend' style='margin-bottom:12px;'></div>
+    <div style='position:relative;width:100%;height:360px;'>
+      <canvas id='trendCanvas' style='width:100%;height:360px;display:block;'></canvas>
+      <div id='trendTooltip' class='hidden' style='position:absolute;pointer-events:none;background:rgba(15,23,42,0.95);border:1px solid #6c6cf5;border-radius:8px;padding:8px 11px;font-size:12px;color:#e2e8f0;box-shadow:0 6px 18px rgba(0,0,0,0.45);z-index:5;min-width:165px;'></div>
+    </div>
+    <div style='font-size:12px;color:var(--muted);margin-top:8px;'>
+      💡 提示：点击上方图例可单独隐藏/显示某类折线；鼠标移到折线图上可查看任意时刻各类型设备的精确在线数。
+    </div>
+  </div>
+</div>
+
+<!-- ==================== TAB 4: 异常诊断与修正方案专项视图 ==================== -->
 <div id='viewAlerts' class='hidden'>
   <div class='card' style='margin-bottom:16px;'>
     <div class='section-title'>
@@ -3983,8 +4092,12 @@ let topoSearchQuery = '';
 let lastTopoNodeSig = '';
 let collapsedGroups = {};
 let topoGroupBoxes = [];
+let showGhost24h = false;
 let selectedNodeId = null;
 let nicDrawerOpen = false;
+let trendHiddenSeries = {};
+let trendHoverIdx = -1;
+let trendLastSlice = [];
 
 // Table Sorting State
 let sortCol = '';
@@ -4066,15 +4179,19 @@ function switchTab(tab) {
   currentTab = tab;
   document.getElementById('tabBtnOverview').checked = (tab === 'overview');
   document.getElementById('tabBtnTopo').checked = (tab === 'topology');
+  const trBtn = document.getElementById('tabBtnTrend');
+  if (trBtn) trBtn.checked = (tab === 'trend');
   document.getElementById('tabBtnAlerts').checked = (tab === 'alerts');
 
   const views = {
     overview: document.getElementById('viewOverview'),
     topology: document.getElementById('viewTopology'),
+    trend: document.getElementById('viewTrend'),
     alerts: document.getElementById('viewAlerts')
   };
   Object.keys(views).forEach(k => {
     const el = views[k];
+    if (!el) return;
     el.classList.toggle('hidden', k !== tab);
     if (k === tab) {
       el.classList.remove('tab-pane-anim');
@@ -4095,9 +4212,20 @@ function switchTab(tab) {
       fitTopologyToView();
     });
   }
+  if (tab === 'trend') {
+    requestAnimationFrame(() => renderHostTrend());
+  }
   if (tab === 'alerts') {
     loadLogDates(true);
   }
+}
+
+function toggleGhost24h() {
+  const chk = document.getElementById('chkGhost24h');
+  const lbl = document.getElementById('lblGhost24h');
+  showGhost24h = !!(chk && chk.checked);
+  if (lbl) lbl.classList.toggle('active', showGhost24h);
+  autoArrangeTopology();
 }
 
 async function loadLogDates(alsoLoadContent) {
@@ -4541,6 +4669,7 @@ function renderStatus(d) {
 
   drawChart(d.history || []);
   rebuildTopologyGraph(d);
+  if (currentTab === 'trend') renderHostTrend();
   if (selectedNodeId) renderInspector(selectedNodeId);
 }
 
@@ -4697,11 +4826,24 @@ function rebuildTopologyGraph(d) {
   }
   edges.push({ from: gwNode.id, to: swNode.id, kbps: d.currentKBps, label: d.gatewayLatencyMs >= 0 ? d.gatewayLatencyMs.toFixed(1) + 'ms' : 'LAN', type: 'backbone' });
 
-  // 5. Filter & add LAN Endpoint Hosts
-  const endpointHosts = d.hosts.filter(h => {
+  // 5. Filter & add LAN Endpoint Hosts (plus optional 24h offline ghost hosts when 24h留影 is enabled)
+  const ghostList = d.ghostHosts || [];
+  const gcBadge = document.getElementById('ghostCountBadge');
+  if (gcBadge) gcBadge.textContent = '(' + ghostList.length + ')';
+
+  const combinedHosts = (d.hosts || []).map(h => Object.assign({}, h, { isGhost: false }));
+  if (showGhost24h && ghostList.length > 0) {
+    ghostList.forEach(g => {
+      combinedHosts.push(Object.assign({}, g, {
+        isGhost: true, isGw: false, txKBps: 0, rxKBps: 0, pps: 0, bcastPps: 0, synRate: 0, retransPct: 0, totalPkts: 0, macCount: 1, activities: ''
+      }));
+    });
+  }
+
+  const endpointHosts = combinedHosts.filter(h => {
     if (h.ip === gwIp || h.isGw) return false;
-    const isAnomaly = !h.isLocal || h.macCount > 1 || h.bcastPps >= 80 || h.retransPct >= 4.5 || alertMap[h.ip];
-    const isActive = (h.txKBps + h.rxKBps) > 0.1 || h.pps > 0 || h.ip === d.activeAdapter.ip;
+    const isAnomaly = !h.isGhost && (!h.isLocal || h.macCount > 1 || h.bcastPps >= 80 || h.retransPct >= 4.5 || alertMap[h.ip]);
+    const isActive = !h.isGhost && ((h.txKBps + h.rxKBps) > 0.1 || h.pps > 0 || h.ip === d.activeAdapter.ip);
     if (filter === 'active') return isActive;
     if (filter === 'anomaly') return isAnomaly || h.ip === d.activeAdapter.ip;
     if (filter === 'pc_nas') return h.role === 'pc' || h.role === 'nas' || h.role === 'probe';
@@ -4709,9 +4851,10 @@ function rebuildTopologyGraph(d) {
     return true;
   });
 
-  // Sort endpoints deterministically by role + numeric IP so nodes never jump around on refresh
+  // Sort endpoints deterministically by online-first + role + numeric IP so nodes never jump around on refresh
   const roleOrder = { rogue: 0, netdev: 1, nas: 2, probe: 3, pc: 4, camera: 5, mobile: 6 };
   endpointHosts.sort((a, b) => {
+    if (a.isGhost !== b.isGhost) return a.isGhost ? 1 : -1;
     const rd = (roleOrder[a.role] ?? 9) - (roleOrder[b.role] ?? 9);
     if (rd !== 0) return rd;
     return ipToNum(a.ip) - ipToNum(b.ip);
@@ -4719,24 +4862,27 @@ function rebuildTopologyGraph(d) {
 
   // Find if there is a subordinate router / AP node to visually group or attach to switch
   endpointHosts.forEach(h => {
-    let st = 'ok';
-    if (!h.isLocal || h.macCount > 1 || alertMap[h.ip]?.severity === 'critical') st = 'crit';
-    else if (h.bcastPps >= 50 || h.retransPct >= 4.0 || (h.txKBps + h.rxKBps) > 2048 || alertMap[h.ip]) st = 'warn';
+    let st = h.isGhost ? 'ghost' : 'ok';
+    if (!h.isGhost) {
+      if (!h.isLocal || h.macCount > 1 || alertMap[h.ip]?.severity === 'critical') st = 'crit';
+      else if (h.bcastPps >= 50 || h.retransPct >= 4.0 || (h.txKBps + h.rxKBps) > 2048 || alertMap[h.ip]) st = 'warn';
+    }
 
     let shortName = h.alias || (h.hostname ? h.hostname.replace(' (本机)', '') : '');
     if (!shortName || shortName === '-') {
-      shortName = h.vendor.split(' ')[0];
+      shortName = (h.vendor || '设备').split(' ')[0];
     }
     if (shortName.length > 14) shortName = shortName.slice(0, 14) + '…';
 
     const nd = {
       id: h.ip,
       label: shortName,
-      sub: h.ip,
+      sub: h.isGhost ? (h.ip + ' · 离线') : h.ip,
       role: h.role || 'pc',
       status: st,
+      isGhost: !!h.isGhost,
       kbps: (h.txKBps || 0) + (h.rxKBps || 0),
-      radius: h.role === 'probe' || h.role === 'nas' || h.role === 'netdev' ? 21 : 18,
+      radius: h.isGhost ? 17 : (h.role === 'probe' || h.role === 'nas' || h.role === 'netdev' ? 21 : 18),
       raw: h
     };
     nodes.push(nd);
@@ -4744,9 +4890,9 @@ function rebuildTopologyGraph(d) {
     edges.push({
       from: swNode.id,
       to: nd.id,
-      kbps: nd.kbps,
-      label: nd.kbps >= 1 ? (nd.kbps >= 1024 ? (nd.kbps / 1024).toFixed(1) + 'MB/s' : nd.kbps.toFixed(0) + 'KB/s') : '',
-      type: st === 'crit' ? 'alert' : 'lan'
+      kbps: h.isGhost ? 0 : nd.kbps,
+      label: (!h.isGhost && nd.kbps >= 1) ? (nd.kbps >= 1024 ? (nd.kbps / 1024).toFixed(1) + 'MB/s' : nd.kbps.toFixed(0) + 'KB/s') : '',
+      type: h.isGhost ? 'ghost' : (st === 'crit' ? 'alert' : 'lan')
     });
   });
 
@@ -4770,7 +4916,7 @@ function rebuildTopologyGraph(d) {
   });
 
   // 7. Auto-arrange check: if auto-arrange is ON and device set changed (e.g. new morning device joined), re-pack non-pinned nodes cleanly
-  const nodeSig = topoLayout + '|' + topoGroupBy + '|' + endpointHosts.map(h => h.ip).join(',');
+  const nodeSig = topoLayout + '|' + topoGroupBy + '|' + (showGhost24h ? '1' : '0') + '|' + endpointHosts.map(h => h.ip + (h.isGhost ? 'g' : '')).join(',');
   const membershipChanged = (lastTopoNodeSig !== '' && nodeSig !== lastTopoNodeSig);
   lastTopoNodeSig = nodeSig;
   if (autoArrangeEnabled && membershipChanged) {
@@ -4847,6 +4993,9 @@ function resolveAnyNodeOverlap(nodes, minDist) {
 
 function classifyEndpointGroup(nd, mode) {
   const h = nd.raw || {};
+  if (nd.isGhost && mode === 'status') {
+    return { key: 'st_ghost', title: '👻 24小时内离线留影设备', order: 8, crit: false };
+  }
   if (mode === 'status') {
     if (nd.status === 'crit' || nd.status === 'warn') return { key: 'st_anom', title: '🚨 异常与疑点设备', order: 0, crit: true };
     if (nd.role === 'netdev' || nd.role === 'nas' || nd.role === 'probe') return { key: 'st_infra', title: '📶 网络设施与存储', order: 1, crit: false };
@@ -5197,7 +5346,11 @@ function drawTopologyFrame() {
       } else {
         ctx.moveTo(n1.x, n1.y);
         ctx.lineTo(n2.x, n2.y);
-        if (e.type === 'alert') {
+        if (e.type === 'ghost') {
+          ctx.setLineDash([3, 5]);
+          ctx.strokeStyle = 'rgba(148, 163, 184, 0.22)';
+          ctx.lineWidth = 1.1;
+        } else if (e.type === 'alert') {
           ctx.setLineDash([6, 4]);
           ctx.strokeStyle = 'rgba(239, 68, 68, 0.85)';
           ctx.lineWidth = 2.2;
@@ -5245,7 +5398,8 @@ function drawTopologyFrame() {
       const isSelected = n.id === selectedNodeId;
       const isSearchMatch = !topoSearchQuery || nodeMatchesSearch(n, topoSearchQuery);
       ctx.save();
-      if (!isSearchMatch) ctx.globalAlpha = 0.18;
+      if (!isSearchMatch) ctx.globalAlpha = 0.16;
+      else if (n.isGhost) ctx.globalAlpha = isSelected ? 0.78 : 0.42;
 
       if (topoSearchQuery && isSearchMatch) {
         ctx.beginPath();
@@ -5256,7 +5410,7 @@ function drawTopologyFrame() {
       }
 
       // Radiating sonar / soundwave rings for anomalous (crit / warn) nodes
-      if (n.status === 'crit' || n.status === 'warn') {
+      if (!n.isGhost && (n.status === 'crit' || n.status === 'warn')) {
         const isCrit = n.status === 'crit';
         const waveCount = isCrit ? 3 : 2;
         const maxSpread = isCrit ? 36 : 24;
@@ -5280,29 +5434,34 @@ function drawTopologyFrame() {
         ctx.stroke();
       }
 
-      // Node Circle
+      // Node Circle (monochrome dashed ring for 24h offline ghost nodes)
       ctx.beginPath();
       ctx.arc(n.x, n.y, n.radius, 0, Math.PI * 2);
-      ctx.fillStyle = '#0f172a';
+      ctx.fillStyle = n.isGhost ? '#1e222b' : '#0f172a';
       ctx.fill();
-      ctx.lineWidth = isSelected ? 3.2 : 2.2;
-      ctx.strokeStyle = n.status === 'crit' ? '#ef4444' : (n.status === 'warn' ? '#f59e0b' : rm.color);
+      ctx.lineWidth = isSelected ? 3.2 : (n.isGhost ? 1.8 : 2.2);
+      if (n.isGhost) ctx.setLineDash([4, 3]);
+      ctx.strokeStyle = n.isGhost ? '#94a3b8' : (n.status === 'crit' ? '#ef4444' : (n.status === 'warn' ? '#f59e0b' : rm.color));
       ctx.stroke();
+      ctx.setLineDash([]);
 
-      // Icon inside node
+      // Icon inside node (monochrome grayscale for 24h ghost nodes)
+      ctx.save();
+      if (n.isGhost) { try { ctx.filter = 'grayscale(100%)'; } catch (e) {} }
       ctx.font = (n.radius >= 24 ? '18px' : '15px') + ' sans-serif';
       ctx.textAlign = 'center';
       ctx.textBaseline = 'middle';
       ctx.fillText(rm.icon, n.x, n.y);
+      ctx.restore();
 
       // Node Title & IP Label Pill below node
       ctx.textBaseline = 'alphabetic';
       ctx.font = 'bold 12px -apple-system, Microsoft YaHei, sans-serif';
-      ctx.fillStyle = isSelected ? '#38bdf8' : '#f8fafc';
+      ctx.fillStyle = n.isGhost ? '#cbd5e1' : (isSelected ? '#38bdf8' : '#f8fafc');
       ctx.fillText(n.label, n.x, n.y + n.radius + 15);
 
       ctx.font = '11px Consolas, Monaco, monospace';
-      ctx.fillStyle = n.status === 'crit' ? '#fca5a5' : '#94a3b8';
+      ctx.fillStyle = n.isGhost ? '#94a3b8' : (n.status === 'crit' ? '#fca5a5' : '#94a3b8');
       ctx.fillText(n.sub, n.x, n.y + n.radius + 29);
       ctx.restore();
     });
@@ -5317,7 +5476,9 @@ let lastInspectorNodeId = null;
 function renderInspector(nodeId, forceRebuild) {
   if (!lastStatus) return;
   const nd = topoGraphNodes.find(n => n.id === nodeId);
-  const h = (lastStatus.hosts || []).find(x => x.ip === nodeId) || (nd ? nd.raw : null);
+  const h = (lastStatus.hosts || []).find(x => x.ip === nodeId)
+    || (lastStatus.ghostHosts || []).find(x => x.ip === nodeId)
+    || (nd ? nd.raw : null);
   const body = document.getElementById('inspectorBody');
   const badge = document.getElementById('inspBadge');
   if (!h) {
@@ -5327,9 +5488,10 @@ function renderInspector(nodeId, forceRebuild) {
   }
 
   const rm = ROLE_META[h.role] || ROLE_META.pc;
+  const isGhost = !!h.isGhost || !(lastStatus.hosts || []).some(x => x.ip === h.ip) && (lastStatus.ghostHosts || []).some(x => x.ip === h.ip);
   const nodeAlerts = (lastStatus.alerts || []).filter(a => a.ip === h.ip);
-  badge.textContent = rm.label;
-  badge.className = 'tag ' + (nodeAlerts.length > 0 || h.isLocal === false ? 'critical' : 'ok');
+  badge.textContent = isGhost ? '👻 24h离线留影' : rm.label;
+  badge.className = 'tag ' + (isGhost ? 'warning' : (nodeAlerts.length > 0 || h.isLocal === false ? 'critical' : 'ok'));
 
   const peerLinks = (lastStatus.links || []).filter(l => l.src === h.ip || l.dst === h.ip);
   const isRealIp = /^\d+\.\d+\.\d+\.\d+$/.test(h.ip || '') && h.role !== 'internet' && h.role !== 'switch';
@@ -5737,8 +5899,201 @@ function exportReport() {
   a.click();
 }
 
-window.addEventListener('resize', resizeTopoCanvas);
+const TREND_SERIES = [
+  { key: 'tot', label: '上线节点总数', color: '#f8fafc', width: 2.8, dash: [] },
+  { key: 'pc',  label: '电脑 / 服务器', color: '#60a5fa', width: 2.1, dash: [] },
+  { key: 'mob', label: '移动终端 (手机/手表)', color: '#ec4899', width: 2.1, dash: [] },
+  { key: 'net', label: '网络设备 / NAS', color: '#a855f7', width: 2.0, dash: [] },
+  { key: 'cam', label: '安防监控 / IoT', color: '#14b8a6', width: 2.0, dash: [] },
+  { key: 'rog', label: '异网段异常节点', color: '#ef4444', width: 2.0, dash: [5, 3] }
+];
+
+function toggleTrendSeries(key) {
+  trendHiddenSeries[key] = !trendHiddenSeries[key];
+  renderHostTrend();
+}
+
+function renderHostTrend() {
+  if (!lastStatus) return;
+  const d = lastStatus;
+  const allPts = (d.hostTrend || []).slice();
+  const hosts = d.hosts || [];
+  const ghosts = d.ghostHosts || [];
+
+  // Always append live current snapshot as the rightmost point so the chart is never empty right after startup
+  let cPc = 0, cMob = 0, cNet = 0, cCam = 0, cRog = 0;
+  hosts.forEach(h => {
+    if (h.role === 'rogue') cRog++;
+    else if (h.role === 'mobile') cMob++;
+    else if (h.role === 'camera') cCam++;
+    else if (h.role === 'gateway' || h.role === 'netdev' || h.role === 'nas') cNet++;
+    else cPc++;
+  });
+  const nowTime = (d.time || '').slice(11, 16) || '当前';
+  if (allPts.length === 0 || allPts[allPts.length - 1].t !== nowTime) {
+    allPts.push({ t: nowTime, tot: hosts.length, pc: cPc, mob: cMob, net: cNet, cam: cCam, rog: cRog });
+  }
+
+  // Update summary cards
+  const elNow = document.getElementById('trNowTotal');
+  if (elNow) elNow.textContent = hosts.length + ' 台';
+  let peak = 0, peakT = '-';
+  allPts.forEach(p => { if (p.tot >= peak) { peak = p.tot; peakT = p.t; } });
+  const elPeak = document.getElementById('trPeakTotal');
+  if (elPeak) elPeak.textContent = peak + ' 台';
+  const elPeakT = document.getElementById('trPeakTime');
+  if (elPeakT) elPeakT.textContent = '峰值出现时刻: ' + peakT + ' (共 ' + allPts.length + ' 个分钟采样点)';
+  const el24 = document.getElementById('tr24hSeen');
+  if (el24) el24.textContent = (hosts.length + ghosts.length) + ' 台';
+  const el24G = document.getElementById('tr24hGhost');
+  if (el24G) el24G.textContent = '含当前已离线 24h 留影设备: ' + ghosts.length + ' 台';
+  const elBr = document.getElementById('trBreakdown');
+  if (elBr) elBr.innerHTML = `<span style='color:#60a5fa'>💻${cPc}</span> · <span style='color:#ec4899'>📱${cMob}</span> · <span style='color:#a855f7'>📶${cNet}</span> · <span style='color:#14b8a6'>📷${cCam}</span> · <span style='color:#ef4444'>⚠️${cRog}</span>`;
+
+  // Render clickable legend
+  const leg = document.getElementById('trendLegendBar');
+  if (leg) {
+    leg.innerHTML = TREND_SERIES.map(s => {
+      const off = !!trendHiddenSeries[s.key];
+      const curVal = allPts.length ? allPts[allPts.length - 1][s.key] : 0;
+      return `<div class='trend-leg-btn ${off ? 'off' : ''}' onclick='toggleTrendSeries(""${s.key}"")'>
+        <span class='trend-swatch' style='background:${s.color};'></span>
+        <span>${s.label}</span>
+        <b style='color:${s.color};'>${curVal}</b>
+      </div>`;
+    }).join('');
+  }
+
+  // Slice by selected range
+  const rangeVal = parseInt((document.getElementById('trendRangeSel') || {}).value || '1440', 10);
+  const pts = allPts.length > rangeVal ? allPts.slice(allPts.length - rangeVal) : allPts;
+  trendLastSlice = pts;
+
+  const canvas = document.getElementById('trendCanvas');
+  if (!canvas) return;
+  const rect = canvas.getBoundingClientRect();
+  if (rect.width < 100) return;
+  const dpr = window.devicePixelRatio || 1;
+  const W = Math.floor(rect.width), H = Math.floor(rect.height || 360);
+  if (canvas.width !== Math.floor(W * dpr) || canvas.height !== Math.floor(H * dpr)) {
+    canvas.width = Math.floor(W * dpr);
+    canvas.height = Math.floor(H * dpr);
+  }
+  const ctx = canvas.getContext('2d');
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.clearRect(0, 0, W, H);
+
+  const padL = 44, padR = 20, padT = 18, padB = 34;
+  const plotW = Math.max(40, W - padL - padR);
+  const plotH = Math.max(40, H - padT - padB);
+
+  let maxY = 5;
+  pts.forEach(p => {
+    TREND_SERIES.forEach(s => {
+      if (!trendHiddenSeries[s.key] && p[s.key] > maxY) maxY = p[s.key];
+    });
+  });
+  maxY = Math.ceil(maxY * 1.15);
+
+  // Grid & Y-axis labels
+  const yTicks = 5;
+  ctx.font = '11px Consolas, Monaco, monospace';
+  ctx.textAlign = 'right';
+  ctx.textBaseline = 'middle';
+  for (let i = 0; i <= yTicks; i++) {
+    const val = Math.round((maxY / yTicks) * i);
+    const y = padT + plotH - (val / maxY) * plotH;
+    ctx.strokeStyle = 'rgba(148,163,184,0.14)';
+    ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.moveTo(padL, y); ctx.lineTo(padL + plotW, y); ctx.stroke();
+    ctx.fillStyle = '#9aa0a6';
+    ctx.fillText(val, padL - 8, y);
+  }
+
+  // X-axis labels
+  const xStep = Math.max(1, Math.ceil(pts.length / 10));
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'top';
+  for (let i = 0; i < pts.length; i += xStep) {
+    const x = pts.length === 1 ? (padL + plotW / 2) : (padL + (i / (pts.length - 1)) * plotW);
+    ctx.fillStyle = '#9aa0a6';
+    ctx.fillText(pts[i].t, x, padT + plotH + 10);
+  }
+  if (pts.length > 1) {
+    ctx.fillText(pts[pts.length - 1].t, padL + plotW, padT + plotH + 10);
+  }
+
+  // Draw each series line
+  TREND_SERIES.forEach(s => {
+    if (trendHiddenSeries[s.key]) return;
+    ctx.save();
+    ctx.strokeStyle = s.color;
+    ctx.lineWidth = s.width;
+    ctx.setLineDash(s.dash);
+    ctx.beginPath();
+    pts.forEach((p, idx) => {
+      const x = pts.length === 1 ? (padL + plotW / 2) : (padL + (idx / (pts.length - 1)) * plotW);
+      const y = padT + plotH - ((p[s.key] || 0) / maxY) * plotH;
+      if (idx === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+    });
+    ctx.stroke();
+    ctx.setLineDash([]);
+    // Draw dots if few points
+    if (pts.length <= 30) {
+      pts.forEach((p, idx) => {
+        const x = pts.length === 1 ? (padL + plotW / 2) : (padL + (idx / (pts.length - 1)) * plotW);
+        const y = padT + plotH - ((p[s.key] || 0) / maxY) * plotH;
+        ctx.beginPath(); ctx.arc(x, y, 3, 0, Math.PI * 2); ctx.fillStyle = s.color; ctx.fill();
+      });
+    }
+    ctx.restore();
+  });
+
+  // Hover crosshair
+  if (trendHoverIdx >= 0 && trendHoverIdx < pts.length) {
+    const hx = pts.length === 1 ? (padL + plotW / 2) : (padL + (trendHoverIdx / (pts.length - 1)) * plotW);
+    ctx.save();
+    ctx.strokeStyle = 'rgba(108,108,245,0.65)';
+    ctx.setLineDash([4, 4]);
+    ctx.lineWidth = 1.2;
+    ctx.beginPath(); ctx.moveTo(hx, padT); ctx.lineTo(hx, padT + plotH); ctx.stroke();
+    ctx.restore();
+  }
+}
+
+function initTrendEvents() {
+  const canvas = document.getElementById('trendCanvas');
+  const tip = document.getElementById('trendTooltip');
+  if (!canvas || !tip) return;
+  canvas.addEventListener('mousemove', e => {
+    const pts = trendLastSlice || [];
+    if (pts.length === 0) return;
+    const rect = canvas.getBoundingClientRect();
+    const mx = e.clientX - rect.left;
+    const padL = 44, padR = 20;
+    const plotW = Math.max(40, rect.width - padL - padR);
+    const ratio = Math.max(0, Math.min(1, (mx - padL) / plotW));
+    const idx = pts.length === 1 ? 0 : Math.round(ratio * (pts.length - 1));
+    trendHoverIdx = idx;
+    const p = pts[idx];
+    tip.classList.remove('hidden');
+    tip.innerHTML = `<div style='font-weight:700;color:#fff;margin-bottom:4px;'>🕒 ${p.t}</div>` +
+      TREND_SERIES.map(s => `<div style='display:flex;justify-content:space-between;gap:12px;'><span><span style='color:${s.color};'>●</span> ${s.label}</span><b>${p[s.key]}</b></div>`).join('');
+    const leftPos = (mx + 190 > rect.width) ? Math.max(8, mx - 185) : (mx + 14);
+    tip.style.left = leftPos + 'px';
+    tip.style.top = '18px';
+    renderHostTrend();
+  });
+  canvas.addEventListener('mouseleave', () => {
+    trendHoverIdx = -1;
+    tip.classList.add('hidden');
+    renderHostTrend();
+  });
+}
+
+window.addEventListener('resize', () => { resizeTopoCanvas(); if (currentTab === 'trend') renderHostTrend(); });
 initTopoEvents();
+initTrendEvents();
 requestAnimationFrame(drawTopologyFrame);
 fetchStatus();
 setInterval(fetchStatus, 1000);
