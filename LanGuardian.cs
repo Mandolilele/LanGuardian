@@ -145,6 +145,17 @@ namespace LanGuardian
         public DateTime LastSeen = DateTime.Now;
     }
 
+    public class DeviceNote
+    {
+        public string Mac = "";
+        public string Alias = "";
+        public string Owner = "";
+        public string Location = "";
+        public string Note = "";
+        public string LastIp = "";
+        public string UpdatedAt = "";
+    }
+
     internal static class NativeWin
     {
         [DllImport("iphlpapi.dll", ExactSpelling = true)]
@@ -302,9 +313,12 @@ namespace LanGuardian
 
     public class MonitorEngine
     {
-        public const string AppVersion = "v1.6.1";
+        public const string AppVersion = "v1.7.0";
         public string LogDirectory = "";
         private readonly object _logLock = new object();
+        private readonly object _notesLock = new object();
+        public ConcurrentDictionary<string, DeviceNote> DeviceNotes = new ConcurrentDictionary<string, DeviceNote>(StringComparer.OrdinalIgnoreCase);
+        public ConcurrentDictionary<string, string> MacToObservedHostname = new ConcurrentDictionary<string, string>(StringComparer.OrdinalIgnoreCase);
         private readonly ConcurrentDictionary<string, DateTime> _lastAlertLogTime = new ConcurrentDictionary<string, DateTime>();
         private int _summaryTick = 0;
 
@@ -527,6 +541,7 @@ namespace LanGuardian
         public void Start(string preferredIpOrAdapter)
         {
             LogDirectory = ResolveLogDirectory();
+            LoadDeviceNotes();
             if (string.IsNullOrEmpty(preferredIpOrAdapter))
             {
                 preferredIpOrAdapter = LoadSavedAdapterPreference();
@@ -1321,25 +1336,37 @@ namespace LanGuardian
             int udpDataOffset = offset + 8;
             int udpDataLen = len - 8;
 
-            // 1. DHCP Server response check (Rogue DHCP detector! Server sends from port 67 to 68)
-            if (srcPort == 67 && (dstPort == 68 || dstPort == 67) && udpDataLen >= 240)
+            // 1. DHCP Server response check (port 67 -> 68) & DHCP Client request hostname/OS fingerprinting (port 68 -> 67)
+            if ((srcPort == 67 || dstPort == 67) && udpDataLen >= 240)
             {
                 ProcessDhcpPacket(buf, udpDataOffset, udpDataLen, srcIp, srcMac, srcHost);
             }
 
-            // 2. DNS / mDNS query extraction (port 53 or 5353)
-            if ((dstPort == 53 || dstPort == 5353 || srcPort == 5353) && udpDataLen >= 12)
+            // 2. DNS / mDNS / LLMNR query extraction (port 53, 5353, 5355)
+            if ((dstPort == 53 || dstPort == 5353 || srcPort == 5353 || dstPort == 5355 || srcPort == 5355) && udpDataLen >= 12)
             {
                 string qname = TryExtractDnsQName(buf, udpDataOffset, udpDataLen);
                 if (!string.IsNullOrEmpty(qname) && srcHost != null)
                 {
                     Interlocked.Increment(ref srcHost.DnsQueryPkts);
-                    if (dstPort == 5353 && qname.EndsWith(".local", StringComparison.OrdinalIgnoreCase))
+                    if (dstPort == 5353 || srcPort == 5353)
                     {
-                        string baseName = qname.Substring(0, qname.Length - 6);
-                        if (!baseName.StartsWith("_") && !baseName.Contains("._tcp") && !baseName.Contains("._udp") && string.IsNullOrEmpty(srcHost.Hostname))
+                        if (qname.EndsWith(".local", StringComparison.OrdinalIgnoreCase))
                         {
-                            srcHost.Hostname = baseName;
+                            string baseName = qname.Substring(0, qname.Length - 6);
+                            if (!baseName.StartsWith("_") && !baseName.Contains("._tcp") && !baseName.Contains("._udp") && baseName.Length >= 2)
+                            {
+                                if (string.IsNullOrEmpty(srcHost.Hostname)) srcHost.Hostname = baseName;
+                                if (IsValidUnicastMac(srcHost.Mac)) MacToObservedHostname[srcHost.Mac] = baseName;
+                            }
+                        }
+                    }
+                    else if (dstPort == 5355 || srcPort == 5355)
+                    {
+                        string clean = qname.Split('.')[0];
+                        if (!string.IsNullOrEmpty(clean) && clean.Length >= 2 && clean.Length <= 32)
+                        {
+                            srcHost.AddActivity("LLMNR: " + clean);
                         }
                     }
                     else
@@ -1348,12 +1375,99 @@ namespace LanGuardian
                     }
                 }
             }
+
+            // 3. SSDP / UPnP device fingerprint (port 1900)
+            if ((dstPort == 1900 || srcPort == 1900) && udpDataLen >= 24 && srcHost != null)
+            {
+                ProcessSsdpPacket(buf, udpDataOffset, udpDataLen, srcHost);
+            }
+        }
+
+        private void ProcessSsdpPacket(byte[] buf, int offset, int len, HostStats srcHost)
+        {
+            try
+            {
+                int checkLen = Math.Min(len, 512);
+                string s = Encoding.ASCII.GetString(buf, offset, checkLen);
+                if (!s.StartsWith("NOTIFY ") && !s.StartsWith("HTTP/1.1 200") && !s.StartsWith("M-SEARCH ")) return;
+                var lines = s.Split(new[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries);
+                foreach (var line in lines)
+                {
+                    if (line.StartsWith("SERVER:", StringComparison.OrdinalIgnoreCase))
+                    {
+                        string sv = line.Substring(7).Trim();
+                        if (!string.IsNullOrEmpty(sv))
+                        {
+                            if (sv.Length > 64) sv = sv.Substring(0, 64);
+                            srcHost.AddActivity("SSDP: " + sv);
+                        }
+                        break;
+                    }
+                }
+            }
+            catch { }
         }
 
         private void ProcessDhcpPacket(byte[] buf, int offset, int len, string srcIp, string srcMac, HostStats srcHost)
         {
             if (len < 240) return;
-            byte op = buf[offset]; // 1 = BOOTREQUEST, 2 = BOOTREPLY (Offer / ACK)
+            byte op = buf[offset]; // 1 = BOOTREQUEST (Client), 2 = BOOTREPLY (Server Offer/ACK)
+            if (op == 1)
+            {
+                // Parse DHCP Client Request: chaddr (client MAC) + Option 12 (Hostname) + Option 60 (Vendor Class) + Option 50 (Requested IP)
+                string chaddrMac = FormatMac(buf, offset + 28);
+                if (!IsValidUnicastMac(chaddrMac)) chaddrMac = srcMac;
+                string dhcpHost = "";
+                string dhcpVendor = "";
+                string reqIp = "";
+                // Verify DHCP magic cookie 99.130.83.99 (0x63 0x82 0x53 0x63) at offset+236
+                if (len > 240 && buf[offset + 236] == 0x63 && buf[offset + 237] == 0x82 && buf[offset + 238] == 0x53 && buf[offset + 239] == 0x63)
+                {
+                    int pos = offset + 240;
+                    int end = offset + len;
+                    while (pos < end)
+                    {
+                        byte optCode = buf[pos++];
+                        if (optCode == 255) break; // End
+                        if (optCode == 0) continue; // Pad
+                        if (pos >= end) break;
+                        int optLen = buf[pos++];
+                        if (pos + optLen > end) break;
+                        if (optCode == 12 && optLen > 0 && optLen <= 64) // Hostname
+                        {
+                            dhcpHost = Encoding.UTF8.GetString(buf, pos, optLen).Trim('\0', ' ');
+                        }
+                        else if (optCode == 60 && optLen > 0 && optLen <= 64) // Vendor Class ID
+                        {
+                            dhcpVendor = Encoding.ASCII.GetString(buf, pos, optLen).Trim('\0', ' ');
+                        }
+                        else if (optCode == 50 && optLen == 4) // Requested IP
+                        {
+                            reqIp = string.Format("{0}.{1}.{2}.{3}", buf[pos], buf[pos + 1], buf[pos + 2], buf[pos + 3]);
+                        }
+                        pos += optLen;
+                    }
+                }
+                if (!string.IsNullOrEmpty(dhcpHost))
+                {
+                    if (IsValidUnicastMac(chaddrMac)) MacToObservedHostname[chaddrMac] = dhcpHost;
+                    HostStats target = srcHost;
+                    if (target == null && !string.IsNullOrEmpty(reqIp) && IsInCurrentSubnet(reqIp))
+                    {
+                        target = GetOrAddHost(reqIp, chaddrMac);
+                    }
+                    if (target == null && IsValidUnicastMac(chaddrMac))
+                    {
+                        target = Hosts.Values.FirstOrDefault(x => string.Equals(x.Mac, chaddrMac, StringComparison.OrdinalIgnoreCase));
+                    }
+                    if (target != null)
+                    {
+                        if (string.IsNullOrEmpty(target.Hostname) || target.Hostname.StartsWith("未知")) target.Hostname = dhcpHost;
+                        target.AddActivity("DHCP设备名: " + dhcpHost + (string.IsNullOrEmpty(dhcpVendor) ? "" : (" [" + dhcpVendor + "]")));
+                    }
+                }
+                return;
+            }
             if (op != 2) return;
 
             string offeredIp = string.Format("{0}.{1}.{2}.{3}", buf[offset + 16], buf[offset + 17], buf[offset + 18], buf[offset + 19]);
@@ -2124,7 +2238,7 @@ namespace LanGuardian
             if (v.Contains("QNAP") || v.Contains("SYNOLOGY") || v.Contains("NAS") || n.Contains("NAS")) return "nas";
             if (v.Contains("NETGEAR") || v.Contains("网件") || v.Contains("TP-LINK") || v.Contains("WAYOS") || n.Contains("WNDR") || n.Contains("TL-W")) return "netdev";
             if (v.Contains("创米") || v.Contains("领普") || v.Contains("海康") || n.Contains("CAMERA") || n.Contains("DOORBELL") || n.Contains("IPC")) return "camera";
-            if (v.Contains("移动终端") || v.Contains("小米") || v.Contains("华为") || n.Contains("REDMI") || n.Contains("XIAOMI") || n.Contains("OPPO") || n.Contains("IPHONE")) return "mobile";
+            if (v.Contains("移动终端") || v.Contains("小米") || v.Contains("华为") || n.Contains("REDMI") || n.Contains("XIAOMI") || n.Contains("OPPO") || n.Contains("VIVO") || n.Contains("IPHONE") || n.Contains("IPAD") || n.Contains("ANDROID") || n.Contains("HUAWEI") || n.Contains("HONOR") || n.Contains("GALAXY") || n.Contains("PIXEL")) return "mobile";
             return "pc";
         }
 
@@ -2182,6 +2296,14 @@ namespace LanGuardian
                 {
                     h.Mac = normMac;
                     h.Vendor = OuiDb.Lookup(normMac);
+                    if (string.IsNullOrEmpty(h.Hostname))
+                    {
+                        string obsName;
+                        if (MacToObservedHostname.TryGetValue(normMac, out obsName) && !string.IsNullOrEmpty(obsName))
+                        {
+                            h.Hostname = obsName;
+                        }
+                    }
                     // Only record MAC for ARP conflict check if this IP is in our local subnet
                     if (h.IsLocalSubnet)
                     {
@@ -2710,6 +2832,215 @@ namespace LanGuardian
                 "{{\"ok\":true,\"ip\":\"{0}\",\"netbios\":\"{1}\",\"dns\":\"{2}\",\"httpTitle\":\"{3}\",\"ports\":[{4}],\"guess\":\"{5}\"}}",
                 esc(ip), esc(nbName), esc(dnsName), esc(httpTitle), string.Join(",", sortedPorts), esc(guess));
         }
+
+        private static string GetNotesPath()
+        {
+            try { return Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "LanGuardian_Notes.json"); }
+            catch { return "LanGuardian_Notes.json"; }
+        }
+
+        private static string JsonEsc(string s)
+        {
+            if (string.IsNullOrEmpty(s)) return "";
+            return s.Replace("\\", "\\\\").Replace("\"", "\\\"").Replace("\r", " ").Replace("\n", " ");
+        }
+
+        public string BuildNotesJson()
+        {
+            var sb = new StringBuilder();
+            sb.Append("{\n");
+            sb.Append("  \"schemaVersion\": 1,\n");
+            sb.Append("  \"appVersion\": \"" + JsonEsc(AppVersion) + "\",\n");
+            sb.Append("  \"updatedAt\": \"" + DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss") + "\",\n");
+            sb.Append("  \"notes\": [\n");
+            var list = DeviceNotes.Values.OrderBy(n => n.Alias).ThenBy(n => n.Mac).ToList();
+            for (int i = 0; i < list.Count; i++)
+            {
+                var n = list[i];
+                sb.AppendFormat("    {{\"mac\":\"{0}\",\"alias\":\"{1}\",\"owner\":\"{2}\",\"location\":\"{3}\",\"note\":\"{4}\",\"lastIp\":\"{5}\",\"updatedAt\":\"{6}\"}}{7}\n",
+                    JsonEsc(n.Mac), JsonEsc(n.Alias), JsonEsc(n.Owner), JsonEsc(n.Location), JsonEsc(n.Note), JsonEsc(n.LastIp), JsonEsc(n.UpdatedAt),
+                    i < list.Count - 1 ? "," : "");
+            }
+            sb.Append("  ]\n}");
+            return sb.ToString();
+        }
+
+        public void SaveDeviceNotesToDisk()
+        {
+            try
+            {
+                string json = BuildNotesJson();
+                lock (_notesLock)
+                {
+                    File.WriteAllText(GetNotesPath(), json, new UTF8Encoding(false));
+                }
+            }
+            catch { }
+        }
+
+        public void LoadDeviceNotes()
+        {
+            try
+            {
+                string p = GetNotesPath();
+                if (!File.Exists(p)) return;
+                string json;
+                lock (_notesLock) { json = File.ReadAllText(p, Encoding.UTF8); }
+                ImportDeviceNotesJson(json, false, false);
+            }
+            catch { }
+        }
+
+        public DeviceNote LookupNote(string mac, string ip)
+        {
+            DeviceNote dn;
+            string nm = NormalizeMac(mac);
+            if (!string.IsNullOrEmpty(nm) && DeviceNotes.TryGetValue(nm, out dn)) return dn;
+            if (!string.IsNullOrEmpty(ip) && DeviceNotes.TryGetValue("IP:" + ip, out dn)) return dn;
+            return null;
+        }
+
+        public void UpsertDeviceNote(string mac, string ip, string alias, string owner, string location, string note)
+        {
+            string key = IsValidUnicastMac(mac) ? NormalizeMac(mac) : (!string.IsNullOrEmpty(ip) ? ("IP:" + ip.Trim()) : "");
+            if (string.IsNullOrEmpty(key)) return;
+            alias = (alias ?? "").Trim();
+            owner = (owner ?? "").Trim();
+            location = (location ?? "").Trim();
+            note = (note ?? "").Trim();
+
+            if (string.IsNullOrEmpty(alias) && string.IsNullOrEmpty(owner) && string.IsNullOrEmpty(location) && string.IsNullOrEmpty(note))
+            {
+                DeviceNote removed;
+                DeviceNotes.TryRemove(key, out removed);
+                WriteLog("INFO", "已清除设备备注: " + key + (string.IsNullOrEmpty(ip) ? "" : (" (" + ip + ")")));
+            }
+            else
+            {
+                DeviceNotes[key] = new DeviceNote
+                {
+                    Mac = key,
+                    Alias = alias,
+                    Owner = owner,
+                    Location = location,
+                    Note = note,
+                    LastIp = ip ?? "",
+                    UpdatedAt = DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss")
+                };
+                WriteLog("INFO", string.Format("已保存设备备注: {0} ({1}) -> 别名:{2} 使用人:{3} 位置:{4}", key, ip, alias, owner, location));
+            }
+            SaveDeviceNotesToDisk();
+        }
+
+        public int ImportDeviceNotesJson(string json, bool replaceAll, bool persist = true)
+        {
+            if (string.IsNullOrWhiteSpace(json)) return 0;
+            var parsed = new List<DeviceNote>();
+            // Lightweight zero-dependency JSON array object parser for {"mac":...,"alias":...}
+            int idx = json.IndexOf("\"notes\"", StringComparison.OrdinalIgnoreCase);
+            int arrStart = idx >= 0 ? json.IndexOf('[', idx) : json.IndexOf('[');
+            if (arrStart < 0) return 0;
+
+            int pos = arrStart + 1;
+            int len = json.Length;
+            while (pos < len)
+            {
+                int objStart = json.IndexOf('{', pos);
+                if (objStart < 0) break;
+                // Find matching '}' respecting quotes
+                bool inStr = false;
+                bool escNext = false;
+                int objEnd = -1;
+                for (int i = objStart + 1; i < len; i++)
+                {
+                    char c = json[i];
+                    if (escNext) { escNext = false; continue; }
+                    if (c == '\\' && inStr) { escNext = true; continue; }
+                    if (c == '"') { inStr = !inStr; continue; }
+                    if (!inStr && c == '}') { objEnd = i; break; }
+                }
+                if (objEnd < 0) break;
+                string objStr = json.Substring(objStart + 1, objEnd - objStart - 1);
+                var kv = ParseFlatJsonObject(objStr);
+                string mac = kv.ContainsKey("mac") ? kv["mac"].Trim() : "";
+                string lastIp = kv.ContainsKey("lastIp") ? kv["lastIp"].Trim() : "";
+                string key = IsValidUnicastMac(mac) ? NormalizeMac(mac) : (mac.StartsWith("IP:", StringComparison.OrdinalIgnoreCase) ? mac : (!string.IsNullOrEmpty(lastIp) ? ("IP:" + lastIp) : ""));
+                if (!string.IsNullOrEmpty(key))
+                {
+                    parsed.Add(new DeviceNote
+                    {
+                        Mac = key,
+                        Alias = kv.ContainsKey("alias") ? kv["alias"].Trim() : "",
+                        Owner = kv.ContainsKey("owner") ? kv["owner"].Trim() : "",
+                        Location = kv.ContainsKey("location") ? kv["location"].Trim() : "",
+                        Note = kv.ContainsKey("note") ? kv["note"].Trim() : "",
+                        LastIp = lastIp,
+                        UpdatedAt = kv.ContainsKey("updatedAt") && !string.IsNullOrEmpty(kv["updatedAt"]) ? kv["updatedAt"] : DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss")
+                    });
+                }
+                pos = objEnd + 1;
+            }
+
+            if (replaceAll) DeviceNotes.Clear();
+            foreach (var item in parsed)
+            {
+                DeviceNotes[item.Mac] = item;
+            }
+            if (persist && parsed.Count > 0)
+            {
+                SaveDeviceNotesToDisk();
+                WriteLog("INFO", string.Format("已导入设备备注数据: {0} 条 (模式: {1}, 当前总计: {2} 条)", parsed.Count, replaceAll ? "覆盖" : "合并", DeviceNotes.Count));
+            }
+            return parsed.Count;
+        }
+
+        private static Dictionary<string, string> ParseFlatJsonObject(string body)
+        {
+            var dict = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            int i = 0, n = body.Length;
+            Func<string> readStr = () =>
+            {
+                var sb = new StringBuilder();
+                i++; // skip opening "
+                while (i < n)
+                {
+                    char c = body[i++];
+                    if (c == '\\' && i < n)
+                    {
+                        char nx = body[i++];
+                        if (nx == 'n') sb.Append('\n');
+                        else if (nx == 'r') sb.Append('\r');
+                        else if (nx == 't') sb.Append('\t');
+                        else sb.Append(nx);
+                    }
+                    else if (c == '"') break;
+                    else sb.Append(c);
+                }
+                return sb.ToString();
+            };
+
+            while (i < n)
+            {
+                while (i < n && body[i] != '"') i++;
+                if (i >= n) break;
+                string key = readStr();
+                while (i < n && body[i] != ':') i++;
+                if (i >= n) break;
+                i++; // skip :
+                while (i < n && char.IsWhiteSpace(body[i])) i++;
+                if (i < n && body[i] == '"')
+                {
+                    dict[key] = readStr();
+                }
+                else
+                {
+                    int s = i;
+                    while (i < n && body[i] != ',') i++;
+                    dict[key] = body.Substring(s, i - s).Trim();
+                }
+            }
+            return dict;
+        }
     }
 
     public class WebDashboardServer
@@ -2754,10 +3085,40 @@ namespace LanGuardian
                     client.SendTimeout = 5000;
                     using (var stream = client.GetStream())
                     {
-                        byte[] reqBuf = new byte[8192];
+                        byte[] reqBuf = new byte[16384];
                         int r = stream.Read(reqBuf, 0, reqBuf.Length);
                         if (r <= 0) return;
                         string req = Encoding.UTF8.GetString(reqBuf, 0, r);
+                        string reqBody = "";
+                        int hdrEndIdx = req.IndexOf("\r\n\r\n", StringComparison.Ordinal);
+                        if (hdrEndIdx >= 0)
+                        {
+                            string hdrPart = req.Substring(0, hdrEndIdx);
+                            int contentLen = 0;
+                            foreach (var hl in hdrPart.Split(new[] { "\r\n" }, StringSplitOptions.RemoveEmptyEntries))
+                            {
+                                if (hl.StartsWith("Content-Length:", StringComparison.OrdinalIgnoreCase))
+                                {
+                                    int.TryParse(hl.Substring(15).Trim(), out contentLen);
+                                }
+                            }
+                            if (contentLen > 0 && contentLen <= 2 * 1024 * 1024)
+                            {
+                                int headerByteLen = Encoding.UTF8.GetByteCount(req.Substring(0, hdrEndIdx + 4));
+                                int haveBody = Math.Max(0, r - headerByteLen);
+                                using (var ms = new MemoryStream())
+                                {
+                                    if (haveBody > 0) ms.Write(reqBuf, headerByteLen, haveBody);
+                                    while (ms.Length < contentLen)
+                                    {
+                                        int more = stream.Read(reqBuf, 0, reqBuf.Length);
+                                        if (more <= 0) break;
+                                        ms.Write(reqBuf, 0, more);
+                                    }
+                                    reqBody = Encoding.UTF8.GetString(ms.ToArray());
+                                }
+                            }
+                        }
                         string firstLine = req.Split('\r', '\n')[0];
                         var tokens = firstLine.Split(' ');
                         if (tokens.Length < 2) return;
@@ -2862,6 +3223,44 @@ namespace LanGuardian
                             var q = ParseQuery(query);
                             string ip = q.ContainsKey("ip") ? q["ip"] : "";
                             SendJson(stream, _engine.ProbeHostDeep(ip));
+                        }
+                        else if (path == "/api/notes")
+                        {
+                            var q = ParseQuery(query);
+                            bool dl = q.ContainsKey("download") && q["download"] == "1";
+                            string json = _engine.BuildNotesJson();
+                            if (dl)
+                            {
+                                byte[] body = Encoding.UTF8.GetBytes(json);
+                                string fname = "LanGuardian_Notes_" + DateTime.Now.ToString("yyyy-MM-dd") + ".json";
+                                string hdr = "HTTP/1.1 200 OK\r\nContent-Type: application/json; charset=utf-8\r\nContent-Disposition: attachment; filename=\"" + fname + "\"\r\nCache-Control: no-cache\r\nContent-Length: " + body.Length + "\r\nConnection: close\r\n\r\n";
+                                byte[] hdrBytes = Encoding.ASCII.GetBytes(hdr);
+                                stream.Write(hdrBytes, 0, hdrBytes.Length);
+                                stream.Write(body, 0, body.Length);
+                            }
+                            else
+                            {
+                                SendJson(stream, json);
+                            }
+                        }
+                        else if (path == "/api/note-save")
+                        {
+                            var q = ParseQuery(query);
+                            string mac = q.ContainsKey("mac") ? q["mac"] : "";
+                            string ip = q.ContainsKey("ip") ? q["ip"] : "";
+                            string alias = q.ContainsKey("alias") ? q["alias"] : "";
+                            string owner = q.ContainsKey("owner") ? q["owner"] : "";
+                            string location = q.ContainsKey("location") ? q["location"] : "";
+                            string note = q.ContainsKey("note") ? q["note"] : "";
+                            _engine.UpsertDeviceNote(mac, ip, alias, owner, location, note);
+                            SendJson(stream, "{\"ok\":true,\"total\":" + _engine.DeviceNotes.Count + "}");
+                        }
+                        else if (path == "/api/notes/import")
+                        {
+                            var q = ParseQuery(query);
+                            bool replace = q.ContainsKey("mode") && string.Equals(q["mode"], "replace", StringComparison.OrdinalIgnoreCase);
+                            int imported = _engine.ImportDeviceNotesJson(reqBody, replace, true);
+                            SendJson(stream, string.Format("{{\"ok\":true,\"imported\":{0},\"total\":{1}}}", imported, _engine.DeviceNotes.Count));
                         }
                         else if (path == "/download/LanGuardian.exe")
                         {
@@ -2991,9 +3390,12 @@ namespace LanGuardian
                 if (i > 0) sb.Append(",");
                 string acts = string.Join(" | ", h.RecentActivities);
                 string role = _engine.InferRole(h);
+                var dn = _engine.LookupNote(h.Mac, h.Ip);
                 sb.Append("{");
                 sb.AppendFormat("\"ip\":\"{0}\",\"mac\":\"{1}\",\"vendor\":\"{2}\",\"hostname\":\"{3}\",\"role\":\"{4}\",",
                     Esc(h.Ip), Esc(h.Mac), Esc(h.Vendor), Esc(h.Hostname), Esc(role));
+                sb.AppendFormat("\"alias\":\"{0}\",\"owner\":\"{1}\",\"location\":\"{2}\",\"userNote\":\"{3}\",",
+                    Esc(dn != null ? dn.Alias : ""), Esc(dn != null ? dn.Owner : ""), Esc(dn != null ? dn.Location : ""), Esc(dn != null ? dn.Note : ""));
                 sb.AppendFormat("\"isLocal\":{0},\"isGw\":{1},",
                     h.IsLocalSubnet ? "true" : "false", h.IsGateway ? "true" : "false");
                 sb.AppendFormat("\"txKBps\":{0:F1},\"rxKBps\":{1:F1},\"totalMB\":{2:F2},",
@@ -3409,7 +3811,12 @@ tr:hover { background: rgba(56,189,248,0.08); }
 
   <div class='card'>
     <div class='section-title'>
-      <span>局域网活跃节点与流量监控清单 (点击任意行可在拓扑图中定位并透视该节点)</span>
+      <span>局域网活跃节点与流量监控清单 (点击任意行可在拓扑图中定位、备注与透视)</span>
+      <div style='display:flex;align-items:center;gap:6px;flex-wrap:wrap;'>
+        <button class='secondary' style='padding:4px 10px;font-size:12px;' onclick='exportDeviceNotes()' title='导出所有按 MAC 绑定的设备备注 JSON，可用于跨门店/服务器互通'>📤 导出备注库</button>
+        <button class='secondary' style='padding:4px 10px;font-size:12px;' onclick='triggerImportNotes()' title='导入设备备注 JSON 文件（自动合并到当前备注库）'>📥 导入备注库</button>
+        <input id='notesFileInput' type='file' accept='.json,application/json' class='hidden' onchange='handleImportNotesFile(event)'>
+      </div>
     </div>
     <div style='overflow-x:auto;'>
       <table>
@@ -3840,7 +4247,7 @@ function onTopoSearchKey(e) {
 function nodeMatchesSearch(n, q) {
   if (!q) return true;
   const r = n.raw || {};
-  const hay = [n.id, n.label, n.sub, r.ip, r.hostname, r.mac, r.vendor, r.role, r.activities]
+  const hay = [n.id, n.label, n.sub, r.ip, r.alias, r.owner, r.location, r.userNote, r.hostname, r.mac, r.vendor, r.role, r.activities]
     .filter(Boolean).join(' ').toLowerCase();
   return hay.includes(q);
 }
@@ -4087,11 +4494,15 @@ function renderStatus(d) {
 
     const rm = ROLE_META[h.role] || ROLE_META.pc;
 
-    return `<tr class='${!h.isLocal ? 'foreign-row' : ''}' onclick='focusNodeInTopo(""${h.ip}"")' title='点击在网络拓扑图中定位并查看该节点详情'>
+    const dispName = h.alias
+      ? `<b style='color:#c7c7ff;'>🏷️ ${h.alias}</b>${h.location ? (' <span style=\'font-size:11px;color:#9aa0a6;\'>[' + h.location + ']</span>') : ''}${h.hostname ? ('<div style=\'font-size:11px;color:#9aa0a6;\'>' + h.hostname + '</div>') : ''}`
+      : (h.hostname || '-');
+
+    return `<tr class='${!h.isLocal ? 'foreign-row' : ''}' onclick='focusNodeInTopo(""${h.ip}"")' title='点击在网络拓扑图中定位、备注并查看该节点详情'>
       <td>${badge}</td>
       <td>${rm.icon} <span style='font-size:12px;color:var(--muted)'>${rm.label}</span></td>
       <td class='mono'><b>${h.ip}</b></td>
-      <td>${h.hostname || '-'}</td>
+      <td>${dispName}</td>
       <td class='mono'>${h.mac || '-'}</td>
       <td>${h.vendor}</td>
       <td class='mono' style='color:${h.rxKBps > 1024 ? 'var(--warn)' : 'inherit'}'>${h.rxKBps.toFixed(1)} KB/s</td>
@@ -4289,7 +4700,7 @@ function rebuildTopologyGraph(d) {
     if (!h.isLocal || h.macCount > 1 || alertMap[h.ip]?.severity === 'critical') st = 'crit';
     else if (h.bcastPps >= 50 || h.retransPct >= 4.0 || (h.txKBps + h.rxKBps) > 2048 || alertMap[h.ip]) st = 'warn';
 
-    let shortName = h.hostname ? h.hostname.replace(' (本机)', '') : '';
+    let shortName = h.alias || (h.hostname ? h.hostname.replace(' (本机)', '') : '');
     if (!shortName || shortName === '-') {
       shortName = h.vendor.split(' ')[0];
     }
@@ -4905,8 +5316,8 @@ function renderInspector(nodeId, forceRebuild) {
     <div style='display:flex;align-items:center;gap:10px;background:rgba(15,23,42,0.7);padding:10px 12px;border-radius:8px;border:1px solid var(--border);'>
       <div style='font-size:26px;'>${rm.icon}</div>
       <div>
-        <div style='font-size:15px;font-weight:700;color:#fff;'>${h.hostname || h.vendor || h.ip}</div>
-        <div class='mono' style='color:var(--accent);font-size:12.5px;'>${h.ip}</div>
+        <div style='font-size:15px;font-weight:700;color:#fff;'>${h.alias ? ('🏷️ ' + h.alias) : (h.hostname || h.vendor || h.ip)}</div>
+        <div class='mono' style='color:var(--accent);font-size:12.5px;'>${h.ip}${h.owner || h.location ? (' · ' + [h.owner, h.location].filter(Boolean).join(' / ')) : ''}</div>
       </div>
     </div>
 
@@ -4966,7 +5377,25 @@ function renderInspector(nodeId, forceRebuild) {
 
   let actionHtml = '';
   if (isRealIp) {
+    const escAttr = s => String(s || '').replace(/&/g, '&amp;').replace(/""/g, '&quot;').replace(/'/g, '&#39;');
     actionHtml = `
+      <div class='fix-box' style='border-color:rgba(16,185,129,0.45);background:rgba(16,185,129,0.06);gap:7px;'>
+        <div style='display:flex;justify-content:space-between;align-items:center;'>
+          <span style='color:#6ee7b7;font-weight:700;font-size:13px;'>🏷️ 设备备注 / 资产花名册 (按MAC永久绑定)</span>
+        </div>
+        <div style='display:grid;grid-template-columns:1fr 1fr;gap:6px;'>
+          <input id='noteAlias' type='text' value='${escAttr(h.alias)}' placeholder='备注名(如: 财务-张三)' style='padding:4px 7px;font-size:12px;'>
+          <input id='noteOwner' type='text' value='${escAttr(h.owner)}' placeholder='使用人(如: 张三)' style='padding:4px 7px;font-size:12px;'>
+          <input id='noteLoc' type='text' value='${escAttr(h.location)}' placeholder='位置(如: 二楼3号位)' style='padding:4px 7px;font-size:12px;'>
+          <input id='noteText' type='text' value='${escAttr(h.userNote)}' placeholder='补充说明(可选)' style='padding:4px 7px;font-size:12px;'>
+        </div>
+        <div style='display:flex;gap:6px;align-items:center;'>
+          <button style='padding:4px 10px;font-size:12px;background:#059669;border-color:#10b981;' onclick='saveNodeNote(""${escAttr(h.mac)}"", ""${escAttr(h.ip)}"")'>💾 保存备注</button>
+          <button class='quick-msg-btn' onclick='clearNodeNote(""${escAttr(h.mac)}"", ""${escAttr(h.ip)}"")'>🗑️ 清除</button>
+          <span id='noteSaveMsg' style='font-size:11.5px;color:#6ee7b7;'></span>
+        </div>
+      </div>
+
       <div class='fix-box' style='border-color:rgba(108,108,245,0.45);background:rgba(108,108,245,0.08);gap:8px;'>
         <div style='display:flex;justify-content:space-between;align-items:center;'>
           <span style='color:#c7c7ff;font-weight:700;font-size:13px;'>💬 定位找人 / 快捷发消息</span>
@@ -4998,6 +5427,55 @@ function renderInspector(nodeId, forceRebuild) {
   }
 
   body.innerHTML = `<div id='inspMetricsBox' style='display:flex;flex-direction:column;gap:12px;'>${metricsHtml}</div>${actionHtml}`;
+}
+
+async function saveNodeNote(mac, ip) {
+  const alias = (document.getElementById('noteAlias') || {}).value || '';
+  const owner = (document.getElementById('noteOwner') || {}).value || '';
+  const loc = (document.getElementById('noteLoc') || {}).value || '';
+  const note = (document.getElementById('noteText') || {}).value || '';
+  const qs = `mac=${encodeURIComponent(mac)}&ip=${encodeURIComponent(ip)}&alias=${encodeURIComponent(alias)}&owner=${encodeURIComponent(owner)}&location=${encodeURIComponent(loc)}&note=${encodeURIComponent(note)}`;
+  const r = await fetch('/api/note-save?' + qs);
+  const d = await r.json();
+  const msg = document.getElementById('noteSaveMsg');
+  if (msg) msg.textContent = d.ok ? '✓ 已保存 (共 ' + d.total + ' 条)' : '保存失败';
+  fetchStatus();
+}
+
+async function clearNodeNote(mac, ip) {
+  ['noteAlias', 'noteOwner', 'noteLoc', 'noteText'].forEach(id => {
+    const el = document.getElementById(id);
+    if (el) el.value = '';
+  });
+  await saveNodeNote(mac, ip);
+}
+
+function exportDeviceNotes() {
+  window.open('/api/notes?download=1', '_blank');
+}
+
+function triggerImportNotes() {
+  const inp = document.getElementById('notesFileInput');
+  if (inp) { inp.value = ''; inp.click(); }
+}
+
+async function handleImportNotesFile(ev) {
+  const f = ev.target && ev.target.files ? ev.target.files[0] : null;
+  if (!f) return;
+  try {
+    const txt = await f.text();
+    const r = await fetch('/api/notes/import?mode=merge', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: txt
+    });
+    const d = await r.json();
+    alert(`导入完成！本次合并导入 ${d.imported || 0} 条备注，当前备注库总计 ${d.total || 0} 条。`);
+    lastInspectorNodeId = null;
+    fetchStatus();
+  } catch (e) {
+    alert('导入备注失败: ' + e);
+  }
 }
 
 function fillAndSendMsg(ip, text) {

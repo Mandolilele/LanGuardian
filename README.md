@@ -1,4 +1,4 @@
-# LanGuardian (`v1.6.1`)
+# LanGuardian (`v1.7.0`)
 
 **Windows 局域网实时状况检测、交互式网络拓扑透视、双物理网段串线排查与自动化故障诊断中心**
 
@@ -79,8 +79,11 @@
 | `GET /api/reset-all` | 重置前端实时统计缓存（不影响历史日志文件） |
 | `GET /api/logs` | 列出所有已落盘的按天日志日期与存储目录 |
 | `GET /api/log-file?date=YYYY-MM-DD[&download=1]` | 在线读取或下载指定日期的完整流水日志 |
-| `GET /api/send-msg?ip=...&msg=...[&user=...&pass=...]` | 向目标 Windows 节点推送桌面弹窗消息（支持可选管理员凭据） |
+| `GET /api/send-msg?ip=...&msg=...[&user=...&pass=...]` | 向目标 Windows 节点推送桌面弹窗消息（原生 `wtsapi32.dll`，支持可选管理员凭据） |
 | `GET /api/probe-host?ip=...` | 主动深度侦察目标节点（NetBIOS / DNS / 开放端口 / Web 页面标题） |
+| `GET /api/notes[?download=1]` | 获取或下载所有按 MAC 绑定的设备备注 JSON（`LanGuardian_Notes.json`） |
+| `GET /api/note-save?mac=...&ip=...&alias=...&owner=...&location=...&note=...` | 新增、更新或清除单台设备的永久备注 |
+| `POST /api/notes/import[?mode=merge\|replace]` | 导入外部设备备注 JSON（默认合并模式，便于多门店/后续中心服务器互通） |
 
 ---
 
@@ -99,6 +102,7 @@
 
 ## 6. 版本更新日志（Changelog）
 
+* **`v1.7.0`**：新增二层被动设备名指纹捕获（**DHCP Option 12 主机名 / Option 60 厂商标识 / LLMNR / SSDP**），自动识别 Mac、iPhone、安卓手机等跨平台设备真名；新增 **🏷️ 按 MAC 永久绑定的设备备注/资产花名册**（存为 `LanGuardian_Notes.json`，拓扑图/表格/搜索全面显示），支持 **📤 一键导出 JSON** 与 **📥 一键合并导入 JSON**，为后续企业多站点中心服务器同步做好数据结构准备。
 * **`v1.6.1`**：将远程桌面弹窗推送升级为直接调用 Windows 原生 `wtsapi32.dll` (`WTSOpenServer` / `WTSEnumerateSessions` / `WTSSendMessage`)，彻底摆脱对 `msg.exe` 的依赖，完美兼容 Windows 家庭版探针主机且支持原生 Unicode 标题与精准错误码提示。
 * **`v1.6.0`**：合并界面三处重复网卡控制为顶部唯一可折叠「网卡切换与抓包控制中心」抽屉；右侧节点透视新增 **💬 快捷弹窗发消息（快捷模板 + 可选管理员凭据）** 与 **🔎 深度侦察（NetBIOS / 开放端口 / Web 标题）**；拓扑图新增 **🧹 自动整理 & 🔄 自动避让防重叠**（解决新设备上线圈圈重叠），并新增适合大网段的 **📦 智能分组视图**（支持按疑点 / 网段 / 品牌 / 类型分组与一键折叠）及 **🔍 实时搜索高亮定位**。
 * **`v1.5.0`**：新增实时告警与跨网段异常节点 3 分钟自动消退机制；新增按天持久化日志文件（存放在用户 `Documents\LanGuardianLogs` 目录），支持网页端按日期在线预览与下载，重置前端数据不丢失历史流水。
