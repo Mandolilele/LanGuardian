@@ -193,6 +193,40 @@ namespace LanGuardian
 
         [DllImport("wpcap.dll", CallingConvention = CallingConvention.Cdecl)]
         public static extern void pcap_close(IntPtr p);
+
+        // Native Windows Terminal Services API (works on Windows Home/Pro/Server without msg.exe)
+        [StructLayout(LayoutKind.Sequential)]
+        public struct WTS_SESSION_INFO
+        {
+            public int SessionId;
+            public IntPtr pWinStationName;
+            public int State; // 0 = WTSActive, 1 = WTSConnected
+        }
+
+        [DllImport("wtsapi32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+        public static extern IntPtr WTSOpenServer(string pServerName);
+
+        [DllImport("wtsapi32.dll")]
+        public static extern void WTSCloseServer(IntPtr hServer);
+
+        [DllImport("wtsapi32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+        public static extern bool WTSEnumerateSessions(IntPtr hServer, int Reserved, int Version, out IntPtr ppSessionInfo, out int pCount);
+
+        [DllImport("wtsapi32.dll")]
+        public static extern void WTSFreeMemory(IntPtr pMemory);
+
+        [DllImport("wtsapi32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+        public static extern bool WTSSendMessage(
+            IntPtr hServer,
+            int SessionId,
+            string pTitle,
+            int TitleLength,
+            string pMessage,
+            int MessageLength,
+            int Style,
+            int Timeout,
+            out int pResponse,
+            bool bWait);
     }
 
     public static class OuiDb
@@ -268,7 +302,7 @@ namespace LanGuardian
 
     public class MonitorEngine
     {
-        public const string AppVersion = "v1.6.0";
+        public const string AppVersion = "v1.6.1";
         public string LogDirectory = "";
         private readonly object _logLock = new object();
         private readonly ConcurrentDictionary<string, DateTime> _lastAlertLogTime = new ConcurrentDictionary<string, DateTime>();
@@ -2422,11 +2456,13 @@ namespace LanGuardian
 
             if (!RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
             {
-                detail = "仅 Windows 探针支持 msg.exe 弹窗推送";
+                detail = "仅 Windows 探针支持远程桌面弹窗推送";
                 return false;
             }
 
             bool mountedIpc = false;
+            IntPtr hServer = IntPtr.Zero;
+            IntPtr pSessions = IntPtr.Zero;
             try
             {
                 if (!string.IsNullOrWhiteSpace(user))
@@ -2449,59 +2485,112 @@ namespace LanGuardian
                     }
                 }
 
-                string msgExe = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.System), "msg.exe");
-                if (!File.Exists(msgExe)) msgExe = "msg.exe";
+                bool isSelf = (ip == "127.0.0.1" || LocalHostIps.Contains(ip));
+                hServer = isSelf ? IntPtr.Zero : NativeWin.WTSOpenServer(ip);
+                if (!isSelf && hServer == IntPtr.Zero)
+                {
+                    int err = Marshal.GetLastWin32Error();
+                    detail = "无法打开目标主机服务 (Win32 Error " + err + ")";
+                    hint = "请检查目标主机是否在线，或改用【深度侦察】识别设备。";
+                    return false;
+                }
 
-                var psi = new ProcessStartInfo
+                int sessCount = 0;
+                bool enumOk = false;
+                int enumErr = 0;
+                var enumTask = Task.Run(() =>
                 {
-                    FileName = msgExe,
-                    Arguments = string.Format("* /SERVER:{0} /TIME:60 \"{1}\"", ip, cleanMsg),
-                    RedirectStandardOutput = true,
-                    RedirectStandardError = true,
-                    UseShellExecute = false,
-                    CreateNoWindow = true
-                };
-                using (var p = Process.Start(psi))
+                    IntPtr ptr;
+                    int cnt;
+                    bool ok = NativeWin.WTSEnumerateSessions(hServer, 0, 1, out ptr, out cnt);
+                    int e = ok ? 0 : Marshal.GetLastWin32Error();
+                    return Tuple.Create(ok, ptr, cnt, e);
+                });
+
+                if (!enumTask.Wait(5000))
                 {
-                    string stdout = p.StandardOutput.ReadToEnd();
-                    string stderr = p.StandardError.ReadToEnd();
-                    if (!p.WaitForExit(6000))
+                    detail = "连接目标设备 RPC 超时 (5秒无响应)";
+                    hint = "对方可能是手机/路由器/已关机，或开启了 Windows 防火墙拦截 RPC。建议点击【深度侦察】查看主机名与 Web 管理页。";
+                    WriteLog("INFO", string.Format("向 {0} 发送弹窗消息失败(超时): {1}", ip, cleanMsg));
+                    return false;
+                }
+
+                enumOk = enumTask.Result.Item1;
+                pSessions = enumTask.Result.Item2;
+                sessCount = enumTask.Result.Item3;
+                enumErr = enumTask.Result.Item4;
+
+                if (!enumOk)
+                {
+                    detail = "远程弹窗被目标拒绝或不可达 (Win32 Error " + enumErr + ")";
+                    if (enumErr == 5)
                     {
-                        try { p.Kill(); } catch { }
-                        detail = "连接目标设备超时 (6秒无响应)";
-                        hint = "目标可能是手机/路由器/已关机，或开启了防火墙拦截 RPC 端口。";
-                        WriteLog("INFO", string.Format("向 {0} 发送弹窗消息失败(超时): {1}", ip, cleanMsg));
-                        return false;
+                        hint = "权限不足 (Error 5)：目标 Windows 拒绝了匿名/当前账户的远程消息请求。请展开下方填写目标机的管理员账号密码重试（或目标机需开启 AllowRemoteRPC）。";
                     }
-                    string combined = ((stdout ?? "") + " " + (stderr ?? "")).Trim();
-                    if (p.ExitCode == 0)
+                    else if (enumErr == 1722 || enumErr == 1753 || enumErr == 53)
                     {
-                        detail = "弹窗消息已成功送达 " + ip + " 的桌面屏幕！";
-                        hint = "对方屏幕上会弹出系统消息窗口（持续 60 秒或点击确定关闭）。";
-                        WriteLog("INFO", string.Format("已向 {0} 发送弹窗消息: {1}", ip, cleanMsg));
-                        return true;
-                    }
-                    detail = string.IsNullOrEmpty(combined) ? ("发送失败 (退出码 " + p.ExitCode + ")") : combined;
-                    if (detail.IndexOf("5", StringComparison.OrdinalIgnoreCase) >= 0 || detail.IndexOf("拒绝", StringComparison.OrdinalIgnoreCase) >= 0 || detail.IndexOf("denied", StringComparison.OrdinalIgnoreCase) >= 0)
-                    {
-                        hint = "目标 Windows 拒绝了远程消息（常见于工作组无权限或未开启 AllowRemoteRPC）。可展开下方填写目标管理员账号密码重试，或改用【深度侦察】识别设备。";
+                        hint = "目标未开放 Windows RPC 弹窗服务 (Error " + enumErr + ")：对方可能是手机、路由器、Mac、或防火墙拦截了 135/445 端口。建议点击【深度侦察】识别设备。";
                     }
                     else
                     {
-                        hint = "Windows msg.exe 仅对开启了远程 RPC 的 Windows 专业版/企业版电脑生效；手机、路由器、Mac 或 Windows 家庭版会拒绝连接，建议点击【深度侦察】查主机名与 Web 管理页。";
+                        hint = "目标设备不支持或拦截了 Windows 远程弹窗 (Error " + enumErr + ")，建议改用【深度侦察】查主机名与开放端口。";
                     }
-                    WriteLog("INFO", string.Format("向 {0} 发送弹窗消息未成功 ({1}): {2}", ip, detail, cleanMsg));
+                    WriteLog("INFO", string.Format("向 {0} 发送弹窗消息未成功 (Error {1}): {2}", ip, enumErr, cleanMsg));
+                    return false;
+                }
+
+                string title = "LanGuardian 网管通知";
+                int titleBytes = title.Length * 2;
+                int msgBytes = cleanMsg.Length * 2;
+                int structSize = Marshal.SizeOf(typeof(NativeWin.WTS_SESSION_INFO));
+                int sentCount = 0;
+                int lastSendErr = 0;
+
+                for (int i = 0; i < sessCount; i++)
+                {
+                    IntPtr cur = IntPtr.Add(pSessions, i * structSize);
+                    var si = Marshal.PtrToStructure<NativeWin.WTS_SESSION_INFO>(cur);
+                    // Send to active (0) or connected (1) user desktop sessions (skip Session 0 services)
+                    if (si.SessionId > 0 && (si.State == 0 || si.State == 1))
+                    {
+                        int resp;
+                        bool sent = NativeWin.WTSSendMessage(hServer, si.SessionId, title, titleBytes, cleanMsg, msgBytes, 0x00000040, 60, out resp, false);
+                        if (sent) sentCount++;
+                        else lastSendErr = Marshal.GetLastWin32Error();
+                    }
+                }
+
+                if (sentCount > 0)
+                {
+                    detail = string.Format("弹窗消息已成功送达 {0}（已推送至 {1} 个活跃桌面会话）！", ip, sentCount);
+                    hint = "对方屏幕上会立即弹出「LanGuardian 网管通知」系统窗口（60 秒或点击确定关闭）。";
+                    WriteLog("INFO", string.Format("已通过 WTS API 向 {0} 发送弹窗消息({1}个会话): {2}", ip, sentCount, cleanMsg));
+                    return true;
+                }
+                else
+                {
+                    detail = "已连上目标主机，但未找到可弹窗的活跃桌面会话" + (lastSendErr != 0 ? (" (Error " + lastSendErr + ")") : "");
+                    hint = "目标电脑可能处于未登录/锁屏休眠状态，或拒绝了消息显示。";
+                    WriteLog("INFO", string.Format("向 {0} 发送弹窗消息无活跃会话 (Error {1}): {2}", ip, lastSendErr, cleanMsg));
                     return false;
                 }
             }
             catch (Exception ex)
             {
-                detail = "执行 msg.exe 异常: " + ex.Message;
-                hint = "当前探针系统（如部分 Windows 家庭版）可能未内置 msg.exe。";
+                detail = "调用 Windows 弹窗接口异常: " + ex.Message;
+                hint = "请检查目标主机网络连通性或改用【深度侦察】。";
                 return false;
             }
             finally
             {
+                if (pSessions != IntPtr.Zero)
+                {
+                    try { NativeWin.WTSFreeMemory(pSessions); } catch { }
+                }
+                if (hServer != IntPtr.Zero)
+                {
+                    try { NativeWin.WTSCloseServer(hServer); } catch { }
+                }
                 if (mountedIpc)
                 {
                     try
